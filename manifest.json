@@ -1,0 +1,9 @@
+{
+  "name": "CustomTextureReplacer",
+  "version_number": "1.3.0",
+  "website_url": "",
+  "description": "Swap any texture in TCG Card Shop Simulator at runtime with folder watching, automatic resizing, and texture dump tooling.",
+  "dependencies": [
+    "BepInEx/BepInExPack_TCGCardShopSimulator-5.4.2100"
+  ]
+}
