@@ -3,11 +3,12 @@
 Custom Texture Replacer lets you swap any in-game texture in **TCG Card Shop Simulator** at runtime. Drop your own PNG assets in the `BepInEx/plugins/CustomTextures` folder and the plugin will discover, resize if needed, and inject them without restarting the game. It is fully compatible with Thunderstore Mod Manager and r2modman.
 
 ## Features
-- Watches `BepInEx/plugins/CustomTextures` for new or updated `.png` files and reapplies changes automatically.
-- Maintains `BepInEx/plugins/TexturesList.txt` and `SpritesList.txt`, a living index of every texture name sprite and resolution discovered in the current session.
-- Hooks into Unity asset loading so replacements stay applied across scene loads, asset bundle fetches, and dynamically created sprites.
-- Falls back to automatic RenderTexture-based resizing when a replacement PNG does not match the original dimensions (matching resolutions still gives the best results).
-- Ships with optional debug logging (`BepInEx/plugins/CustomTextureReplacer.debug.log`) for troubleshooting texture discovery and swap events.
+- Watches every `CustomTextures` folder under `BepInEx/plugins`, including sibling mod directories, and honours configurable priority rules so duplicate names resolve predictably.
+- Tracks file events so the most recently modified PNG (across all watched folders) is the one injected, keeping rapid iteration reliable.
+- Maintains `BepInEx/plugins/TexturesList.txt` and `SpritesList.txt`, a living index of every texture and sprite discovered during the session.
+- Hooks into Unity asset loading so replacements persist through scene loads, asset bundle fetches, dynamically created sprites, and SpriteAtlas lookups.
+- Handles mismatched resolutions and compressed formats by copying data through a RenderTexture or creating runtime overrides when necessary.
+- Ships with optional debug logging (`BepInEx/plugins/CustomTextureReplacer.debug.log`) for troubleshooting discovery and swap events.
 
 ## Requirements
 - TCG Card Shop Simulator (latest Steam build).
@@ -40,7 +41,7 @@ Custom Texture Replacer lets you swap any in-game texture in **TCG Card Shop Sim
 ### Replace textures
 1. Open `BepInEx/plugins/TexturesList.txt` and locate the texture you want to override.
 2. Create a PNG that matches the entry (the file name should be identical to the texture name; extension must be `.png`). Matching the resolution listed is strongly recommended.
-3. Place the PNG in `BepInEx/plugins/CustomTextures`.
+3. Place the PNG in `BepInEx/plugins/CustomTextures` (or any other watched `CustomTextures` folder provided by a mod).
 4. The plugin detects changes automatically and reapplies replacements on the fly. You can also force a refresh by creating `BepInEx/plugins/CustomTextures.refresh.now`.
 
 > Tip: When the replacement PNG resolution differs, the plugin attempts a RenderTexture resize so the swap still succeeds. For best quality, export PNGs at the exact dimensions shown in `TexturesList.txt`.
@@ -76,12 +77,21 @@ Changes take effect immediately; you do not need to restart the game.
 
 ## Changelog
 ### 1.5.0
-- Fix runtime override regressions that blocked posters/UI sprites from updating after texture edits by refreshing existing override assets in-place.
-- Ensure compressed textures and sprite atlas entries immediately pick up the latest PNG without recreating Unity assets unless required, preserving correct priority resolution.
-- Updated to allow other mods to have CustomTextures folder and choose priority in the config. Default is LastModified.
+- Refresh existing runtime overrides in place so compressed textures and SpriteAtlas entries update immediately after edits.
+- Preserve “last modified wins” behaviour across every watched folder by copying new pixel data into overrides before reuse.
+- Tightened multi-folder discovery and priority handling (LastModified, PreferredFolder, FolderOrder) to make duplicate resolution explicit.
+
+### 1.4.0
+- Added runtime override support for compressed textures and SpriteAtlas entries so posters, UI icons, and other DXT assets can be swapped without artefacts.
+- Apply overrides to materials, renderer property blocks, sprite renderers, and UI images only when assets change to prevent runaway memory usage.
+- Discovered `CustomTextures` folders across sibling mods and introduced priority modes (LastModified, PreferredFolder, FolderOrder).
+- Export command now favours override textures so `CustomTextures.extract.*.now` dumps the in-game artwork.
+- Improved diagnostics around fallback copies and override creation while skipping generated assets during discovery loops.
+
+### 1.3.0
+- Initial Thunderstore release featuring automatic folder watching, texture dumps, runtime refresh triggers, and optional debug logging.
 
 ## Credits
 - Plugin author: Duckieray
 - Powered by BepInEx and Harmony
 - GitHub: https://github.com/Duckieray/TCG_CustomTextureReplacer
-
