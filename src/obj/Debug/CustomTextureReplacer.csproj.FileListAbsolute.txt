@@ -1,0 +1,10 @@
+C:\Users\djray\git\CustomTextureReplacer\build\CustomTextureReplacer.dll
+C:\Users\djray\git\CustomTextureReplacer\build\CustomTextureReplacer.pdb
+C:\Users\djray\git\CustomTextureReplacer\src\obj\Debug\CustomTextureReplacer.csproj.AssemblyReference.cache
+C:\Users\djray\git\CustomTextureReplacer\src\obj\Debug\CustomTextureReplacer.GeneratedMSBuildEditorConfig.editorconfig
+C:\Users\djray\git\CustomTextureReplacer\src\obj\Debug\CustomTextureReplacer.AssemblyInfoInputs.cache
+C:\Users\djray\git\CustomTextureReplacer\src\obj\Debug\CustomTextureReplacer.AssemblyInfo.cs
+C:\Users\djray\git\CustomTextureReplacer\src\obj\Debug\CustomTextureReplacer.csproj.CoreCompileInputs.cache
+C:\Users\djray\git\CustomTextureReplacer\src\obj\Debug\CustomTextureReplacer.sourcelink.json
+C:\Users\djray\git\CustomTextureReplacer\src\obj\Debug\CustomTextureReplacer.dll
+C:\Users\djray\git\CustomTextureReplacer\src\obj\Debug\CustomTextureReplacer.pdb

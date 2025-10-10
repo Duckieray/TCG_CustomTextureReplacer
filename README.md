@@ -73,7 +73,14 @@ Changes take effect immediately; you do not need to restart the game.
 - **Still stuck?** - Inspect `BepInEx/plugins/CustomTextureReplacer.debug.log` and `BepInEx/LogOutput.log` for warnings; attach them when reporting issues.
 
 ## Changelog
-### 1.3.0
+### 1.4.1
+- Added runtime override support for compressed textures and SpriteAtlas entries so posters, UI icons, and other DXT assets can be overridden without visual glitches.
+- Apply overrides to materials, renderer property blocks, sprite renderers, and UI images only when assets change, eliminating runaway memory growth and stabilising frame times.
+- Export command now favours override textures, guaranteeing `CustomTextures.extract.*.now` dumps the actual in-game artwork.
+- Improved diagnostics around fallback copies and override creation to simplify troubleshooting.
+- Skips scanning generated override assets during texture discovery to avoid redundant refresh loops.
+
+### 1.4.0
 - Initial Thunderstore release featuring automatic folder watching, texture dumps, runtime refresh triggers, and optional debug logging.
 
 ## Credits

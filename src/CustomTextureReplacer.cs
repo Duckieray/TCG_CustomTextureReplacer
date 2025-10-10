@@ -1,4 +1,4 @@
-﻿using BepInEx;
+using BepInEx;
 using BepInEx.Configuration;
 using HarmonyLib;
 using BepInEx.Logging;
@@ -10,7 +10,8 @@ using System.Linq;
 using UnityEngine;
 using UnityEngine.SceneManagement;
 using UnityEngine.U2D;
-
+using UnityEngine.Experimental.Rendering;
+using System.Reflection;
 namespace CustomTextureReplacer
 {
     [BepInPlugin("com.duckieray.cardshop.customtextures", "Custom Texture Replacer", "1.3.0")]
@@ -45,12 +46,28 @@ namespace CustomTextureReplacer
 
         private const string HarmonyId = "com.duckieray.cardshop.customtextures.harmony";
         private const float ScanIntervalSeconds = 2f;
+        private static readonly Type UIImageType = Type.GetType("UnityEngine.UI.Image, UnityEngine.UI");
+        private static readonly PropertyInfo UIImageSpriteProperty = UIImageType?.GetProperty("sprite", BindingFlags.Instance | BindingFlags.Public);
+
+        private static readonly string[] RendererTextureProperties = new[] { "_MainTex", "_BaseMap", "_BaseColorMap", "_BaseTex", "_DiffuseTex", "_EmissionMap", "_AlbedoTex" };
 
         private readonly Dictionary<string, Texture2D> _customTextures = new Dictionary<string, Texture2D>(StringComparer.OrdinalIgnoreCase);
         private readonly HashSet<int> _knownTextureIds = new HashSet<int>();
+        private readonly HashSet<int> _customTextureIds = new HashSet<int>();
         private readonly HashSet<int> _collectionScratch = new HashSet<int>();
+        private readonly HashSet<int> _spriteScratch = new HashSet<int>();
         private readonly List<Texture2D> _textureBuffer = new List<Texture2D>(512);
+        private readonly List<Sprite> _spriteBuffer = new List<Sprite>(512);
         private readonly List<string> _newTextureNames = new List<string>(64);
+        private readonly Dictionary<Texture, Texture> _textureOverrides = new Dictionary<Texture, Texture>();
+        private readonly Dictionary<string, Texture> _textureOverridesByName = new Dictionary<string, Texture>(StringComparer.OrdinalIgnoreCase);
+        private readonly Dictionary<Sprite, Sprite> _spriteOverrides = new Dictionary<Sprite, Sprite>();
+        private readonly Dictionary<string, Sprite> _spriteOverridesByName = new Dictionary<string, Sprite>(StringComparer.OrdinalIgnoreCase);
+        private readonly Dictionary<Sprite, Texture2D> _spriteOverrideTextures = new Dictionary<Sprite, Texture2D>();
+        private readonly HashSet<Texture2D> _generatedTextures = new HashSet<Texture2D>();
+        private readonly HashSet<Sprite> _generatedSprites = new HashSet<Sprite>();
+        private bool _overridesDirty;
+        private readonly MaterialPropertyBlock _propertyBlock = new MaterialPropertyBlock();
 
         private Sprite[] _spriteArray = Array.Empty<Sprite>();
 
@@ -62,7 +79,10 @@ namespace CustomTextureReplacer
         private string _dumpFile = string.Empty;
         private string _dumpTriggerFile = string.Empty;
         private string _refreshTriggerFile = string.Empty;
+        private string _spriteDumpFile = string.Empty;
+        private string _spriteDumpTriggerFile = string.Empty;
         private string _debugLogFile = string.Empty;
+        private string _exportFolder = string.Empty;
 
         private FileSystemWatcher _watcher;
         private Harmony _harmony;
@@ -95,7 +115,11 @@ namespace CustomTextureReplacer
             _dumpFile = Path.Combine(Paths.PluginPath, "TexturesList.txt");
             _dumpTriggerFile = Path.Combine(Paths.PluginPath, "CustomTextures.dump.now");
             _refreshTriggerFile = Path.Combine(Paths.PluginPath, "CustomTextures.refresh.now");
+            _spriteDumpFile = Path.Combine(Paths.PluginPath, "SpritesList.txt");
+            _spriteDumpTriggerFile = Path.Combine(Paths.PluginPath, "SpritesList.dump.now");
             _debugLogFile = Path.Combine(Paths.PluginPath, "CustomTextureReplacer.debug.log");
+            _exportFolder = Path.Combine(Paths.PluginPath, "ExportedTextures");
+            Directory.CreateDirectory(_exportFolder);
 
             SafeAppendDebug("Controller initialised.");
 
@@ -149,8 +173,32 @@ namespace CustomTextureReplacer
             }
 
             _customTextures.Clear();
+            _customTextureIds.Clear();
             _knownTextureIds.Clear();
             _textureBuffer.Clear();
+            _spriteBuffer.Clear();
+            _collectionScratch.Clear();
+            _spriteScratch.Clear();
+
+            foreach (var tex in _generatedTextures)
+            {
+                if (tex != null)
+                    Destroy(tex);
+            }
+            _generatedTextures.Clear();
+
+            foreach (var sprite in _generatedSprites)
+            {
+                if (sprite != null)
+                    Destroy(sprite);
+            }
+            _generatedSprites.Clear();
+
+            _textureOverrides.Clear();
+            _textureOverridesByName.Clear();
+            _spriteOverrides.Clear();
+            _spriteOverridesByName.Clear();
+            _spriteOverrideTextures.Clear();
             Instance = null;
         }
 
@@ -168,6 +216,7 @@ namespace CustomTextureReplacer
                 _logger.LogInfo($"[CustomTextureReplacer] Manual dump triggered via '{Path.GetFileName(_dumpTriggerFile)}'.");
                 SafeAppendDebug("Dump trigger consumed.");
                 DumpAllTextures();
+                DumpAllSprites();
             }
 
             if (CheckAndConsumeFileTrigger(_refreshTriggerFile))
@@ -175,6 +224,13 @@ namespace CustomTextureReplacer
                 _logger.LogInfo($"[CustomTextureReplacer] Manual refresh triggered via '{Path.GetFileName(_refreshTriggerFile)}'.");
                 SafeAppendDebug("Refresh trigger consumed.");
                 ReloadCustomTextures();
+            }
+
+            if (CheckAndConsumeFileTrigger(_spriteDumpTriggerFile))
+            {
+                _logger.LogInfo($"[CustomTextureReplacer] Manual sprite dump triggered via '{Path.GetFileName(_spriteDumpTriggerFile)}'.");
+                SafeAppendDebug("Sprite dump trigger consumed.");
+                DumpAllSprites();
             }
 
             if (_reloadRequested)
@@ -213,6 +269,17 @@ namespace CustomTextureReplacer
                 _pendingDump = false;
                 SafeAppendDebug("Pending dump executed.");
                 DumpAllTextures();
+                DumpAllSprites();
+            }
+
+            ProcessExtractionRequests();
+
+            if (_overridesDirty)
+            {
+                _overridesDirty = false;
+                ApplyTextureOverridesToMaterials();
+                ApplyTextureOverridesToRenderers();
+                ApplySpriteOverridesToComponents();
             }
         }
 
@@ -270,6 +337,7 @@ namespace CustomTextureReplacer
             _logger.LogInfo("[CustomTextureReplacer] Performing initial texture dump.");
             SafeAppendDebug("Initial dump coroutine running.");
             DumpAllTextures();
+            DumpAllSprites();
         }
 
         private IEnumerator ApplyReplacementsNextFrame(string sceneName)
@@ -294,16 +362,21 @@ namespace CustomTextureReplacer
             foreach (var tex in _customTextures.Values)
             {
                 if (tex != null)
+                {
+                    _customTextureIds.Remove(tex.GetInstanceID());
                     Destroy(tex);
+                }
             }
 
             _customTextures.Clear();
+            _customTextureIds.Clear();
 
             foreach (var file in Directory.GetFiles(_textureFolder, "*.png", SearchOption.TopDirectoryOnly))
             {
                 if (TryLoadTexture(file, out var texture))
                 {
                     _customTextures[Path.GetFileNameWithoutExtension(file)] = texture;
+                    _customTextureIds.Add(texture.GetInstanceID());
                 }
             }
 
@@ -379,6 +452,9 @@ namespace CustomTextureReplacer
                 SafeAppendDebug($"Detected {_newTextureNames.Count} new textures");
             }
 
+            if (foundNew)
+                _overridesDirty = true;
+
             return foundNew;
         }
 
@@ -403,50 +479,165 @@ namespace CustomTextureReplacer
                 if (!_customTextures.TryGetValue(target.name, out var replacement))
                     continue;
 
-                if (replacement.width != target.width || replacement.height != target.height)
+                if (ReferenceEquals(replacement, target))
+                    continue;
+
+                var resized = replacement.width != target.width || replacement.height != target.height;
+
+                if (!TryGetSliceDimensions(target, 0, 0, target.width, target.height, out var copyWidth, out var copyHeight, out var clipped, out var reason))
                 {
-                    try
+                    if (!string.IsNullOrEmpty(reason))
                     {
-                        // Resize replacement to target's dimensions using a RenderTexture
-                        RenderTexture rt = RenderTexture.GetTemporary(target.width, target.height);
-                        Graphics.Blit(replacement, rt);
+                        _logger.LogWarning(reason);
+                        SafeAppendDebug(reason);
+                    }
 
-                        RenderTexture.active = rt;
-                        Texture2D resized = new Texture2D(target.width, target.height, TextureFormat.RGBA32, false);
-                        resized.ReadPixels(new Rect(0, 0, rt.width, rt.height), 0, 0);
-                        resized.Apply();
-
-                        RenderTexture.active = null;
-                        RenderTexture.ReleaseTemporary(rt);
-
-                        Graphics.CopyTexture(resized, target);
-                        Destroy(resized);
-
+                    if (TryCreateTextureOverride(target, replacement, target.width, target.height))
+                    {
                         replaced++;
-                        _logger.LogInfo($"[CustomTextureReplacer] Resized + replaced '{target.name}' " +
-                                        $"(custom {replacement.width}x{replacement.height} → game {target.width}x{target.height}).");
-                    }
-                    catch (Exception ex)
-                    {
-                        skipped++;
-                        _logger.LogWarning($"[CustomTextureReplacer] Resize failed for '{target.name}': {ex.Message}");
+                        continue;
                     }
 
+                    skipped++;
                     continue;
                 }
 
-                try
+                if (TryBlitToTexture(replacement, target, copyWidth, copyHeight, out var blitMessage, out var usedFallback))
                 {
-                    Graphics.CopyTexture(replacement, target);
+                    replaced++;
+
+                    if (resized)
+                    {
+                        _logger.LogInfo($"[CustomTextureReplacer] Resized + replaced '{target.name}' (custom {replacement.width}x{replacement.height} -> game {target.width}x{target.height}).");
+                    }
+                    else
+                    {
+                        _logger.LogInfo($"[CustomTextureReplacer] Replaced '{target.name}' (custom {replacement.width}x{replacement.height}).");
+                    }
+
+                    if (clipped)
+                    {
+                        _logger.LogWarning($"[CustomTextureReplacer] Replacement for '{target.name}' was clipped to {copyWidth}x{copyHeight}.");
+                        SafeAppendDebug($"Clipped texture copy for {target.name} to {copyWidth}x{copyHeight}");
+                    }
+
+                    if (!string.IsNullOrEmpty(blitMessage))
+                    {
+                        _logger.LogWarning(blitMessage);
+                        SafeAppendDebug(blitMessage);
+                    }
+
+                    if (usedFallback)
+                    {
+                        TryCreateTextureOverride(target, replacement, target.width, target.height);
+                    }
+                }
+                else if (TryCreateTextureOverride(target, replacement, target.width, target.height))
+                {
                     replaced++;
                 }
-                catch (Exception ex)
+                else
                 {
                     skipped++;
-                    _logger.LogWarning($"[CustomTextureReplacer] Failed to swap '{target.name}': {ex.Message}");
-                    SafeAppendDebug($"Graphics.CopyTexture failed for {target.name}: {ex.Message}");
                 }
             }
+
+            CollectCandidateSprites(_spriteBuffer);
+
+            foreach (var sprite in _spriteBuffer)
+            {
+                if (sprite == null)
+                    continue;
+
+                if (!_customTextures.TryGetValue(sprite.name, out var replacement))
+                    continue;
+
+                var atlasTexture = sprite.texture;
+                if (atlasTexture == null)
+                    continue;
+
+                if (ReferenceEquals(replacement, atlasTexture))
+                    continue;
+
+                if (_customTextureIds.Contains(atlasTexture.GetInstanceID()))
+                    continue;
+
+                var rect = sprite.textureRect;
+                var width = Mathf.RoundToInt(rect.width);
+                var height = Mathf.RoundToInt(rect.height);
+                var x = Mathf.RoundToInt(rect.x);
+                var y = Mathf.RoundToInt(rect.y);
+
+                if (width <= 0 || height <= 0)
+                    continue;
+
+                if (!TryGetTextureSize(atlasTexture, out var atlasWidth, out var atlasHeight))
+                    continue;
+
+                if (!TryGetSliceDimensions(atlasTexture, x, y, width, height, out var copyWidth, out var copyHeight, out var clipped, out var reason))
+                {
+                    if (!string.IsNullOrEmpty(reason))
+                    {
+                        _logger.LogWarning(reason);
+                        SafeAppendDebug(reason);
+                    }
+
+                     if (TryCreateSpriteOverride(sprite, replacement, width, height))
+                    {
+                        replaced++;
+                        continue;
+                    }
+
+                    skipped++;
+                    continue;
+                }
+
+                if (TryBlitToTexture(replacement, atlasTexture, copyWidth, copyHeight, out var blitMessage, out var usedFallback, x, y))
+                {
+                    replaced++;
+
+                    if (copyWidth != width || copyHeight != height)
+                    {
+                        _logger.LogInfo($"[CustomTextureReplacer] Resized + clipped sprite '{sprite.name}' in atlas '{atlasTexture.name}' ({replacement.width}x{replacement.height} -> region {copyWidth}x{copyHeight} at {x},{y}).");
+                    }
+                    else if (width != replacement.width || height != replacement.height)
+                    {
+                        _logger.LogInfo($"[CustomTextureReplacer] Resized + replaced sprite '{sprite.name}' in atlas '{atlasTexture.name}' ({replacement.width}x{replacement.height} -> region {copyWidth}x{copyHeight} at {x},{y}).");
+                    }
+                    else
+                    {
+                        _logger.LogInfo($"[CustomTextureReplacer] Replaced sprite '{sprite.name}' in atlas '{atlasTexture.name}' (region {copyWidth}x{copyHeight} at {x},{y}).");
+                    }
+
+                    if (clipped)
+                    {
+                        _logger.LogWarning($"[CustomTextureReplacer] Sprite '{sprite.name}' in atlas '{atlasTexture.name}' was clipped to {copyWidth}x{copyHeight}.");
+                        SafeAppendDebug($"Clipped sprite copy for {sprite.name} to {copyWidth}x{copyHeight}");
+                    }
+
+                    if (!string.IsNullOrEmpty(blitMessage))
+                    {
+                        _logger.LogWarning(blitMessage);
+                        SafeAppendDebug(blitMessage);
+                    }
+
+                    if (usedFallback)
+                    {
+                        TryCreateSpriteOverride(sprite, replacement, width, height);
+                    }
+                }
+                else if (TryCreateSpriteOverride(sprite, replacement, width, height))
+                {
+                    replaced++;
+                }
+                else
+                {
+                    skipped++;
+                }
+            }
+
+            ApplyTextureOverridesToMaterials();
+            ApplySpriteOverridesToComponents();
 
             if (replaced > 0 || skipped > 0)
             {
@@ -454,7 +645,548 @@ namespace CustomTextureReplacer
                 SafeAppendDebug($"ReplaceAllTextures finished. Success={replaced} Skipped={skipped}");
             }
         }
+        private bool TryBlitToTexture(Texture source, Texture destination, int width, int height, out string extraMessage, out bool usedFallback, int dstX = 0, int dstY = 0)
+        {
+            extraMessage = string.Empty;
+            usedFallback = false;
+            RenderTexture rt = null;
+            Texture2D temp = null;
+            RenderTexture previousRt = null;
+            bool clippedFormat = false;
 
+            try
+            {
+                rt = RenderTexture.GetTemporary(width, height, 0, RenderTextureFormat.ARGB32);
+                Graphics.Blit(source, rt);
+
+                TextureFormat tempFormat = TextureFormat.RGBA32;
+                bool mipChain = false;
+                bool linear = QualitySettings.activeColorSpace == ColorSpace.Linear;
+
+                if (destination is Texture2D destTex)
+                {
+                    tempFormat = destTex.format;
+
+                    if (!ValidateTextureFormat(tempFormat, width, height))
+                    {
+                        tempFormat = TextureFormat.RGBA32;
+                        clippedFormat = true;
+                    }
+                }
+
+                previousRt = RenderTexture.active;
+                RenderTexture.active = rt;
+
+                temp = new Texture2D(width, height, tempFormat, mipChain, linear)
+                {
+                    name = $"{destination?.name}_TempCopy"
+                };
+                temp.ReadPixels(new Rect(0, 0, width, height), 0, 0);
+                temp.Apply(updateMipmaps: false, makeNoLongerReadable: false);
+
+                RenderTexture.active = previousRt;
+                previousRt = null;
+
+                bool success = false;
+
+                try
+                {
+                    Graphics.CopyTexture(temp, 0, 0, 0, 0, width, height, destination, 0, 0, dstX, dstY);
+                    success = true;
+                }
+                catch (Exception copyEx)
+                {
+                    var fullCopy = dstX == 0 && dstY == 0 &&
+                                   destination.width == width &&
+                                   destination.height == height;
+
+                    if (fullCopy)
+                    {
+                        try
+                        {
+                            Graphics.ConvertTexture(temp, destination);
+                            extraMessage = $"[CustomTextureReplacer] ConvertTexture used for '{destination?.name}' after CopyTexture fallback: {copyEx.Message}";
+                            usedFallback = true;
+                            success = true;
+                        }
+                        catch (Exception convertEx)
+                        {
+                            extraMessage = $"[CustomTextureReplacer] ConvertTexture failed for '{destination?.name}': {convertEx.Message}";
+                            success = false;
+                        }
+                    }
+                    else
+                    {
+                        extraMessage = $"[CustomTextureReplacer] CopyTexture failed for '{destination?.name}': {copyEx.Message}";
+                        success = false;
+                    }
+                }
+
+                if (!success && clippedFormat && string.IsNullOrEmpty(extraMessage))
+                {
+                    extraMessage = $"[CustomTextureReplacer] Unable to blit into '{destination?.name}' due to format mismatch.";
+                    usedFallback = true;
+                }
+
+                return success;
+            }
+            finally
+            {
+                if (clippedFormat && string.IsNullOrEmpty(extraMessage))
+                {
+                    extraMessage = $"[CustomTextureReplacer] Fallback format copy used for '{destination?.name}', possible truncation.";
+                    usedFallback = true;
+                }
+
+                if (previousRt != null)
+                    RenderTexture.active = previousRt;
+
+                if (temp != null)
+                    Destroy(temp);
+
+                if (rt != null)
+                    RenderTexture.ReleaseTemporary(rt);
+            }
+        }
+
+        private bool TryCreateTextureOverride(Texture target, Texture2D replacement, int width, int height)
+        {
+            if (!(target is Texture2D targetTex) || replacement == null)
+                return false;
+
+            try
+            {
+                if (_textureOverrides.TryGetValue(targetTex, out var existingOverride))
+                {
+                    if (existingOverride is Texture2D tex2D && tex2D.width == width && tex2D.height == height)
+                    {
+                        _textureOverrides[targetTex] = tex2D;
+                        return true;
+                    }
+                }
+
+                if (_textureOverridesByName.TryGetValue(targetTex.name, out var nameOverride))
+                {
+                    if (nameOverride is Texture2D tex2D && tex2D.width == width && tex2D.height == height)
+                    {
+                        _textureOverrides[targetTex] = tex2D;
+                        _overridesDirty = true;
+                        return true;
+                    }
+                }
+
+                RemoveTextureOverride(targetTex);
+
+                var newTexture = new Texture2D(width, height, TextureFormat.RGBA32, false)
+                {
+                    name = $"{targetTex.name}_Custom",
+                    wrapMode = targetTex.wrapMode,
+                    filterMode = targetTex.filterMode,
+                    anisoLevel = targetTex.anisoLevel
+                };
+
+                RenderTexture rt = RenderTexture.GetTemporary(width, height, 0, RenderTextureFormat.ARGB32);
+                Graphics.Blit(replacement, rt);
+
+                var previous = RenderTexture.active;
+                RenderTexture.active = rt;
+                newTexture.ReadPixels(new Rect(0, 0, width, height), 0, 0);
+                newTexture.Apply();
+                RenderTexture.active = previous;
+                RenderTexture.ReleaseTemporary(rt);
+
+                _generatedTextures.Add(newTexture);
+                _textureOverrides[targetTex] = newTexture;
+                _textureOverridesByName[targetTex.name] = newTexture;
+
+                // Link other instances with the same name to the override.
+                foreach (var tex in Resources.FindObjectsOfTypeAll<Texture2D>())
+                {
+                    if (tex == null)
+                        continue;
+
+                    if (ReferenceEquals(tex, targetTex))
+                        continue;
+
+                    if (string.Equals(tex.name, targetTex.name, StringComparison.OrdinalIgnoreCase))
+                    {
+                        _textureOverrides[tex] = newTexture;
+                    }
+                }
+
+                _logger.LogInfo($"[CustomTextureReplacer] Using runtime texture override for '{targetTex.name}'.");
+                _logger.LogDebug($"[CustomTextureReplacer] Override '{targetTex.name}' uses custom '{replacement.name}' ({replacement.width}x{replacement.height}).");
+                SafeAppendDebug($"Texture override created for {targetTex.name}");
+                _overridesDirty = true;
+                ApplyTextureOverridesToMaterials(targetTex);
+                return true;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning($"[CustomTextureReplacer] Failed to create texture override for '{target?.name}': {ex.Message}");
+                SafeAppendDebug($"Texture override failed for {target?.name}: {ex.Message}");
+                return false;
+            }
+        }
+
+        private bool TryCreateSpriteOverride(Sprite originalSprite, Texture2D replacement, int width, int height)
+        {
+            if (originalSprite == null || replacement == null)
+                return false;
+
+            try
+            {
+                if (_spriteOverridesByName.TryGetValue(originalSprite.name, out var existing) && existing != null)
+                {
+                    var existingTexture = existing.texture;
+                    if (existingTexture != null && existingTexture.width == width && existingTexture.height == height)
+                    {
+                        _spriteOverrides[originalSprite] = existing;
+                        _overridesDirty = true;
+                        return true;
+                    }
+                }
+
+                RemoveSpriteOverride(originalSprite.name);
+
+                RenderTexture rt = RenderTexture.GetTemporary(width, height, 0, RenderTextureFormat.ARGB32);
+                Graphics.Blit(replacement, rt);
+
+                var previous = RenderTexture.active;
+                RenderTexture.active = rt;
+                Texture2D spriteTexture = new Texture2D(width, height, TextureFormat.RGBA32, false)
+                {
+                    name = $"{originalSprite.name}_Custom"
+                };
+                spriteTexture.ReadPixels(new Rect(0, 0, width, height), 0, 0);
+                spriteTexture.Apply();
+                RenderTexture.active = previous;
+                RenderTexture.ReleaseTemporary(rt);
+
+                _generatedTextures.Add(spriteTexture);
+
+                var rect = originalSprite.rect;
+                Vector2 pivotNormalized = rect.size.sqrMagnitude > 0f
+                    ? new Vector2(originalSprite.pivot.x / rect.width, originalSprite.pivot.y / rect.height)
+                    : new Vector2(0.5f, 0.5f);
+
+                var newSprite = Sprite.Create(spriteTexture, new Rect(0, 0, width, height), pivotNormalized, originalSprite.pixelsPerUnit, 0, SpriteMeshType.FullRect, originalSprite.border, false);
+                newSprite.name = originalSprite.name;
+
+                _generatedSprites.Add(newSprite);
+                _spriteOverrideTextures[newSprite] = spriteTexture;
+
+                _spriteOverrides[originalSprite] = newSprite;
+                _spriteOverridesByName[originalSprite.name] = newSprite;
+                _spriteOverrides[newSprite] = newSprite;
+
+                foreach (var sprite in Resources.FindObjectsOfTypeAll<Sprite>())
+                {
+                    if (sprite == null)
+                        continue;
+
+                    if (ReferenceEquals(sprite, originalSprite))
+                        continue;
+
+                    if (string.Equals(sprite.name, originalSprite.name, StringComparison.OrdinalIgnoreCase))
+                    {
+                        _spriteOverrides[sprite] = newSprite;
+                    }
+                }
+
+                _logger.LogInfo($"[CustomTextureReplacer] Created runtime sprite override for '{originalSprite.name}'.");
+                _logger.LogDebug($"[CustomTextureReplacer] Sprite override '{originalSprite.name}' uses custom '{replacement.name}' ({replacement.width}x{replacement.height}).");
+                SafeAppendDebug($"Sprite override created for {originalSprite.name}");
+                _overridesDirty = true;
+                ApplySpriteOverridesToComponents();
+                return true;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning($"[CustomTextureReplacer] Failed to create sprite override for '{originalSprite?.name}': {ex.Message}");
+                SafeAppendDebug($"Sprite override failed for {originalSprite?.name}: {ex.Message}");
+                return false;
+            }
+        }
+
+        private void RemoveTextureOverride(Texture target)
+        {
+            if (target == null)
+                return;
+
+            if (_textureOverrides.TryGetValue(target, out var existing))
+            {
+                _textureOverrides.Remove(target);
+                if (existing is Texture2D tex && _generatedTextures.Remove(tex))
+                {
+                    Destroy(tex);
+                }
+                if (_textureOverridesByName.TryGetValue(target.name, out var mapped) && ReferenceEquals(mapped, existing))
+                {
+                    _textureOverridesByName.Remove(target.name);
+                }
+                _overridesDirty = true;
+            }
+            else if (_textureOverridesByName.TryGetValue(target.name, out var existingByName) && existingByName is Texture2D texByName && _generatedTextures.Remove(texByName))
+            {
+                _textureOverridesByName.Remove(target.name);
+                Destroy(texByName);
+                _overridesDirty = true;
+            }
+        }
+
+        private void RemoveSpriteOverride(string spriteName)
+        {
+            if (string.IsNullOrEmpty(spriteName))
+                return;
+
+            if (_spriteOverridesByName.TryGetValue(spriteName, out var existing))
+            {
+                var keysToRemove = _spriteOverrides.Where(kvp => ReferenceEquals(kvp.Value, existing) || string.Equals(kvp.Key?.name, spriteName, StringComparison.OrdinalIgnoreCase)).Select(kvp => kvp.Key).ToList();
+                foreach (var key in keysToRemove)
+                {
+                    _spriteOverrides.Remove(key);
+                }
+
+                _spriteOverridesByName.Remove(spriteName);
+
+                if (_spriteOverrideTextures.TryGetValue(existing, out var tex))
+                {
+                    _spriteOverrideTextures.Remove(existing);
+                    if (tex != null && _generatedTextures.Remove(tex))
+                        Destroy(tex);
+                }
+
+                if (_generatedSprites.Remove(existing))
+                    Destroy(existing);
+
+                _overridesDirty = true;
+            }
+        }
+
+        private Texture GetReplacementTexture(Texture original)
+        {
+            if (original == null)
+                return null;
+
+            if (_textureOverrides.TryGetValue(original, out var direct))
+                return direct;
+
+            if (_textureOverridesByName.TryGetValue(original.name, out var byName))
+                return byName;
+
+            return null;
+        }
+
+        private Sprite GetReplacementSprite(Sprite original)
+        {
+            if (original == null)
+                return null;
+
+            if (_spriteOverrides.TryGetValue(original, out var direct))
+                return direct;
+
+            if (_spriteOverridesByName.TryGetValue(original.name, out var byName))
+                return byName;
+
+            return null;
+        }
+
+        private void ApplyTextureOverridesToMaterials(Texture targetHint = null)
+        {
+            if (_textureOverrides.Count == 0 && _textureOverridesByName.Count == 0)
+                return;
+
+            foreach (var material in Resources.FindObjectsOfTypeAll<Material>())
+            {
+                if (material == null)
+                    continue;
+
+                foreach (var propertyName in material.GetTexturePropertyNames())
+                {
+                    var current = material.GetTexture(propertyName);
+                    if (current == null)
+                        continue;
+
+                    if (targetHint != null && !ReferenceEquals(current, targetHint) && !string.Equals(current.name, targetHint.name, StringComparison.OrdinalIgnoreCase))
+                        continue;
+
+                    var replacement = GetReplacementTexture(current);
+                    if (replacement != null && !ReferenceEquals(current, replacement))
+                    {
+                        material.SetTexture(propertyName, replacement);
+                    }
+                }
+            }
+        }
+
+        private void ApplyTextureOverridesToRenderers()
+        {
+            if (_textureOverrides.Count == 0 && _textureOverridesByName.Count == 0)
+                return;
+
+            foreach (var renderer in Resources.FindObjectsOfTypeAll<Renderer>())
+            {
+                if (renderer == null)
+                    continue;
+
+                bool blockChanged = false;
+                renderer.GetPropertyBlock(_propertyBlock);
+
+                foreach (var property in RendererTextureProperties)
+                {
+                    Texture current = null;
+                    try
+                    {
+                        current = _propertyBlock.GetTexture(property);
+                    }
+                    catch
+                    {
+                        current = null;
+                    }
+
+                    if (current == null)
+                        continue;
+
+                    var replacement = GetReplacementTexture(current);
+                    if (replacement != null && !ReferenceEquals(current, replacement))
+                    {
+                        _propertyBlock.SetTexture(property, replacement);
+                        blockChanged = true;
+                    }
+                }
+
+                if (blockChanged)
+                {
+                    renderer.SetPropertyBlock(_propertyBlock);
+                }
+            }
+        }
+
+        private void ApplySpriteOverridesToComponents()
+        {
+            if (_spriteOverridesByName.Count == 0 && _spriteOverrides.Count == 0)
+                return;
+
+            foreach (var renderer in Resources.FindObjectsOfTypeAll<SpriteRenderer>())
+            {
+                if (renderer == null)
+                    continue;
+
+                var replacement = GetReplacementSprite(renderer.sprite);
+                if (replacement != null && !ReferenceEquals(renderer.sprite, replacement))
+                {
+                    renderer.sprite = replacement;
+                }
+            }
+
+            if (UIImageType != null && UIImageSpriteProperty != null)
+            {
+                foreach (var obj in Resources.FindObjectsOfTypeAll(UIImageType))
+                {
+                    if (obj == null)
+                        continue;
+
+                    var currentSprite = UIImageSpriteProperty.GetValue(obj) as Sprite;
+                    var replacement = GetReplacementSprite(currentSprite);
+                    if (replacement != null && !ReferenceEquals(currentSprite, replacement))
+                    {
+                        UIImageSpriteProperty.SetValue(obj, replacement);
+                    }
+                }
+            }
+        }
+
+        private bool ValidateTextureFormat(TextureFormat format, int width, int height)
+        {
+            // Reject compressed formats that can't be instanced at runtime with arbitrary sizes.
+            switch (format)
+            {
+                case TextureFormat.DXT1:
+                case TextureFormat.DXT1Crunched:
+                case TextureFormat.DXT5:
+                case TextureFormat.DXT5Crunched:
+                case TextureFormat.BC7:
+                    return false;
+                default:
+                    return true;
+            }
+        }
+
+        private bool TryGetTextureSize(Texture texture, out int width, out int height)
+        {
+            width = 0;
+            height = 0;
+
+            switch (texture)
+            {
+                case Texture2D tex2D:
+                    width = tex2D.width;
+                    height = tex2D.height;
+                    return true;
+                case RenderTexture rt:
+                    width = rt.width;
+                    height = rt.height;
+                    return true;
+                default:
+                    if (texture != null)
+                    {
+                        width = texture.width;
+                        height = texture.height;
+                        return width > 0 && height > 0;
+                    }
+                    return false;
+            }
+        }
+
+        private bool TryGetGraphicsFormat(Texture texture, out GraphicsFormat format)
+        {
+            format = GraphicsFormat.None;
+
+            switch (texture)
+            {
+                case Texture2D tex2D:
+                    format = tex2D.graphicsFormat;
+                    return format != GraphicsFormat.None;
+                case RenderTexture rt:
+                    format = rt.graphicsFormat;
+                    return format != GraphicsFormat.None;
+                default:
+                    return false;
+            }
+        }
+
+        private bool TryGetSliceDimensions(Texture texture, int dstX, int dstY, int width, int height, out int sliceWidth, out int sliceHeight, out bool clipped, out string failureReason)
+        {
+            sliceWidth = 0;
+            sliceHeight = 0;
+            clipped = false;
+            failureReason = string.Empty;
+
+            if (!TryGetTextureSize(texture, out var textureWidth, out var textureHeight))
+                return false;
+
+            var availableWidth = textureWidth - dstX;
+            var availableHeight = textureHeight - dstY;
+
+            if (availableWidth <= 0 || availableHeight <= 0)
+                return false;
+
+            sliceWidth = Mathf.Min(width, availableWidth);
+            sliceHeight = Mathf.Min(height, availableHeight);
+
+            if (sliceWidth <= 0 || sliceHeight <= 0)
+                return false;
+
+            if (TryGetGraphicsFormat(texture, out var format) && GraphicsFormatUtility.IsCompressedFormat(format))
+            {
+                failureReason = $"[CustomTextureReplacer] Texture '{texture?.name ?? "<unnamed>"}' uses compressed format ({format}), switching to runtime override.";
+                return false;
+            }
+
+            clipped = sliceWidth != width || sliceHeight != height;
+            return true;
+        }
         private void DumpAllTextures()
         {
             try
@@ -485,6 +1217,36 @@ namespace CustomTextureReplacer
             }
         }
 
+        private void DumpAllSprites()
+        {
+            try
+            {
+                CollectCandidateSprites(_spriteBuffer);
+                _spriteBuffer.Sort((a, b) => string.Compare(a?.name, b?.name, StringComparison.OrdinalIgnoreCase));
+
+                using var writer = new StreamWriter(_spriteDumpFile, false);
+                foreach (var sprite in _spriteBuffer)
+                {
+                    if (sprite == null)
+                        continue;
+
+                    var texture = sprite.texture;
+                    var textureName = texture != null ? texture.name : "<null>";
+                    var rect = sprite.textureRect;
+                    var line = $"{sprite.name} -> {textureName} ({Mathf.RoundToInt(rect.width)}x{Mathf.RoundToInt(rect.height)} at {Mathf.RoundToInt(rect.x)},{Mathf.RoundToInt(rect.y)})";
+                    writer.WriteLine(line);
+                }
+
+                _logger.LogInfo($"[CustomTextureReplacer] Dumped sprite list to '{_spriteDumpFile}' ({_spriteBuffer.Count} entries).");
+                SafeAppendDebug($"DumpAllSprites wrote {_spriteBuffer.Count} entries");
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning($"[CustomTextureReplacer] Unable to dump sprites: {ex.Message}");
+                SafeAppendDebug($"DumpAllSprites exception: {ex.Message}");
+            }
+        }
+
         private void CollectCandidateTextures(List<Texture2D> destination)
         {
             destination.Clear();
@@ -495,7 +1257,13 @@ namespace CustomTextureReplacer
                 if (tex == null)
                     return;
 
+                if (_generatedTextures.Contains(tex))
+                    return;
+
                 var id = tex.GetInstanceID();
+                if (_customTextureIds.Contains(id))
+                    return;
+
                 if (_collectionScratch.Add(id))
                     destination.Add(tex);
             }
@@ -553,6 +1321,24 @@ namespace CustomTextureReplacer
             }
         }
 
+        private void CollectCandidateSprites(List<Sprite> destination)
+        {
+            destination.Clear();
+            _spriteScratch.Clear();
+
+            foreach (var sprite in Resources.FindObjectsOfTypeAll<Sprite>())
+            {
+                if (sprite == null)
+                    continue;
+
+                if (_generatedSprites.Contains(sprite))
+                    continue;
+
+                if (_spriteScratch.Add(sprite.GetInstanceID()))
+                    destination.Add(sprite);
+            }
+        }
+
         private void RequestReapply(string reason)
         {
             _reapplyRequested = true;
@@ -580,6 +1366,169 @@ namespace CustomTextureReplacer
                 _logger.LogWarning($"[CustomTextureReplacer] Could not consume trigger '{path}': {ex.Message}");
                 SafeAppendDebug($"Trigger error ({Path.GetFileName(path)}): {ex.Message}");
                 return false;
+            }
+        }
+
+        private void ProcessExtractionRequests()
+        {
+            if (string.IsNullOrEmpty(_exportFolder))
+                return;
+
+            try
+            {
+                var files = Directory.GetFiles(Paths.PluginPath, "CustomTextures.extract.*.now", SearchOption.TopDirectoryOnly);
+                if (files.Length == 0)
+                    return;
+
+                foreach (var file in files)
+                {
+                    var fileName = Path.GetFileName(file);
+                    string textureName = ExtractTextureNameFromTrigger(fileName);
+                    try
+                    {
+                        File.Delete(file);
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogWarning($"[CustomTextureReplacer] Could not remove extraction trigger '{fileName}': {ex.Message}");
+                        continue;
+                    }
+
+                    if (string.IsNullOrEmpty(textureName))
+                    {
+                        _logger.LogWarning($"[CustomTextureReplacer] Extraction trigger '{fileName}' did not specify a texture name.");
+                        continue;
+                    }
+
+                    ExportTexture(textureName);
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning($"[CustomTextureReplacer] Unable to process extraction triggers: {ex.Message}");
+            }
+        }
+
+        private static string ExtractTextureNameFromTrigger(string fileName)
+        {
+            const string prefix = "CustomTextures.extract.";
+            const string suffix = ".now";
+
+            if (!fileName.StartsWith(prefix, StringComparison.OrdinalIgnoreCase) ||
+                !fileName.EndsWith(suffix, StringComparison.OrdinalIgnoreCase))
+                return string.Empty;
+
+            var inner = fileName.Substring(prefix.Length, fileName.Length - prefix.Length - suffix.Length);
+            return inner.Replace("%20", " ").Trim();
+        }
+
+        private void ExportTexture(string textureName)
+        {
+            if (string.IsNullOrEmpty(textureName))
+                return;
+
+            CollectCandidateTextures(_textureBuffer);
+
+            var exportTargets = new List<(string name, Texture2D texture)>();
+
+            foreach (var tex in _textureBuffer)
+            {
+                if (tex == null)
+                    continue;
+
+                if (!string.Equals(tex.name, textureName, StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                var replacement = GetReplacementTexture(tex) as Texture2D;
+                if (replacement != null)
+                {
+                    if (!exportTargets.Any(t => ReferenceEquals(t.texture, replacement)))
+                        exportTargets.Add((textureName, replacement));
+                }
+                else if (tex is Texture2D tex2D)
+                {
+                    if (!exportTargets.Any(t => ReferenceEquals(t.texture, tex2D)))
+                        exportTargets.Add((tex.name, tex2D));
+                }
+            }
+
+            if (exportTargets.Count == 0 && _textureOverridesByName.TryGetValue(textureName, out var overrideTex) && overrideTex is Texture2D overrideTex2D)
+            {
+                exportTargets.Add((textureName, overrideTex2D));
+            }
+
+            if (exportTargets.Count == 0)
+            {
+                _logger.LogWarning($"[CustomTextureReplacer] Export failed - could not find texture '{textureName}'.");
+                SafeAppendDebug($"ExportTexture failed for {textureName} (not found)");
+                return;
+            }
+
+            Directory.CreateDirectory(_exportFolder);
+
+            var index = 0;
+            foreach (var entry in exportTargets)
+            {
+                try
+                {
+                    var readable = CreateReadableCopy(entry.texture);
+                    if (readable == null)
+                    {
+                        _logger.LogWarning($"[CustomTextureReplacer] Export failed - could not read texture '{entry.texture.name}'.");
+                        SafeAppendDebug($"ExportTexture failed for {entry.texture.name} (readable copy null)");
+                        continue;
+                    }
+
+                    var bytes = readable.EncodeToPNG();
+                    Destroy(readable);
+
+                    var suffix = exportTargets.Count > 1 ? $"_{index}" : string.Empty;
+                    var outputPath = Path.Combine(_exportFolder, $"{entry.name}{suffix}.png");
+                    File.WriteAllBytes(outputPath, bytes);
+
+                    _logger.LogInfo($"[CustomTextureReplacer] Exported texture '{entry.name}' to '{outputPath}'.");
+                    SafeAppendDebug($"ExportTexture wrote {outputPath}");
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning($"[CustomTextureReplacer] Export failed for '{entry.texture?.name}': {ex.Message}");
+                    SafeAppendDebug($"ExportTexture exception for {entry.texture?.name}: {ex.Message}");
+                }
+
+                index++;
+            }
+        }
+
+        private Texture2D CreateReadableCopy(Texture2D source)
+        {
+            if (source == null)
+                return null;
+
+            try
+            {
+                var width = source.width;
+                var height = source.height;
+
+                RenderTexture rt = RenderTexture.GetTemporary(width, height, 0, RenderTextureFormat.ARGB32);
+                Graphics.Blit(source, rt);
+
+                var previous = RenderTexture.active;
+                RenderTexture.active = rt;
+
+                Texture2D readable = new Texture2D(width, height, TextureFormat.RGBA32, false);
+                readable.ReadPixels(new Rect(0, 0, rt.width, rt.height), 0, 0);
+                readable.Apply();
+
+                RenderTexture.active = previous;
+                RenderTexture.ReleaseTemporary(rt);
+
+                return readable;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning($"[CustomTextureReplacer] Could not create readable copy: {ex.Message}");
+                SafeAppendDebug($"CreateReadableCopy exception: {ex.Message}");
+                return null;
             }
         }
 
@@ -677,5 +1626,9 @@ namespace CustomTextureReplacer
         }
     }
 }
+
+
+
+
 
 
