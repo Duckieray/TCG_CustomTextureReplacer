@@ -44,6 +44,21 @@ namespace CustomTextureReplacer
     {
         internal static ReplacerController Instance { get; private set; }
 
+        private enum FolderPriorityMode
+        {
+            LastModified,
+            PreferredFolder,
+            FolderOrder
+        }
+
+        private struct TextureCandidate
+        {
+            public string Path;
+            public DateTime TimestampUtc;
+            public int FolderIndex;
+            public long EventOrder;
+        }
+
         private const string HarmonyId = "com.duckieray.cardshop.customtextures.harmony";
         private const float ScanIntervalSeconds = 2f;
         private static readonly Type UIImageType = Type.GetType("UnityEngine.UI.Image, UnityEngine.UI");
@@ -68,6 +83,9 @@ namespace CustomTextureReplacer
         private readonly HashSet<Sprite> _generatedSprites = new HashSet<Sprite>();
         private bool _overridesDirty;
         private readonly MaterialPropertyBlock _propertyBlock = new MaterialPropertyBlock();
+        private readonly Dictionary<string, DateTime> _fileEventTimes = new Dictionary<string, DateTime>(StringComparer.OrdinalIgnoreCase);
+        private readonly Dictionary<string, long> _fileEventOrders = new Dictionary<string, long>(StringComparer.OrdinalIgnoreCase);
+        private long _fileEventCounter;
 
         private Sprite[] _spriteArray = Array.Empty<Sprite>();
 
@@ -75,7 +93,7 @@ namespace CustomTextureReplacer
         private ConfigEntry<bool> _logNewTextureNames;
         private ConfigEntry<bool> _logAssetLoads;
 
-        private string _textureFolder = string.Empty;
+        private readonly List<string> _textureFolders = new List<string>();
         private string _dumpFile = string.Empty;
         private string _dumpTriggerFile = string.Empty;
         private string _refreshTriggerFile = string.Empty;
@@ -84,7 +102,12 @@ namespace CustomTextureReplacer
         private string _debugLogFile = string.Empty;
         private string _exportFolder = string.Empty;
 
-        private FileSystemWatcher _watcher;
+        private readonly List<FileSystemWatcher> _watchers = new List<FileSystemWatcher>();
+        private ConfigEntry<FolderPriorityMode> _folderPriorityMode;
+        private ConfigEntry<string> _preferredFolderHint;
+        private string[] _preferredFolderTokens = Array.Empty<string>();
+        private static readonly char[] PreferredFolderSeparators = new[] { ';', ',', '|' };
+
         private Harmony _harmony;
 
         private volatile bool _reloadRequested;
@@ -108,9 +131,25 @@ namespace CustomTextureReplacer
 
             _logNewTextureNames = config.Bind("Debug", "LogNewTextureNames", true, "Log the names of textures discovered during runtime scans.");
             _logAssetLoads = config.Bind("Debug", "LogAssetLoads", true, "Log texture and sprite loads coming from Resources/AssetBundle APIs.");
+            _folderPriorityMode = config.Bind("General", "FolderPriorityMode", FolderPriorityMode.LastModified, "Determines which texture file wins when duplicates exist across folders. Options: LastModified, PreferredFolder, FolderOrder.");
+            _preferredFolderHint = config.Bind("General", "PreferredFolderHint", string.Empty, "When FolderPriorityMode=PreferredFolder, provide folder names or path fragments (separated by ';' ',' or '|') to prioritise.");
 
-            _textureFolder = Path.Combine(Paths.PluginPath, "CustomTextures");
-            Directory.CreateDirectory(_textureFolder);
+            UpdatePreferredFolderTokens();
+
+            _folderPriorityMode.SettingChanged += (_, __) =>
+            {
+                SafeAppendDebug("FolderPriorityMode changed via config.");
+                _reloadRequested = true;
+            };
+
+            _preferredFolderHint.SettingChanged += (_, __) =>
+            {
+                UpdatePreferredFolderTokens();
+                SafeAppendDebug("PreferredFolderHint changed via config.");
+                _reloadRequested = true;
+            };
+
+            DiscoverTextureFolders(logDetails: true);
 
             _dumpFile = Path.Combine(Paths.PluginPath, "TexturesList.txt");
             _dumpTriggerFile = Path.Combine(Paths.PluginPath, "CustomTextures.dump.now");
@@ -127,8 +166,6 @@ namespace CustomTextureReplacer
             _harmony.PatchAll(typeof(ReplacerController).Assembly);
 
             SceneManager.sceneLoaded += OnSceneLoaded;
-            InitialiseWatcher();
-
             ReloadCustomTextures();
             StartCoroutine(InitialDump());
 
@@ -141,20 +178,20 @@ namespace CustomTextureReplacer
 
             SceneManager.sceneLoaded -= OnSceneLoaded;
 
-            if (_watcher != null)
+            foreach (var watcher in _watchers)
             {
                 try
                 {
-                    _watcher.EnableRaisingEvents = false;
-                    _watcher.Created -= OnTextureFileChanged;
-                    _watcher.Changed -= OnTextureFileChanged;
-                    _watcher.Deleted -= OnTextureFileChanged;
-                    _watcher.Renamed -= OnTextureFileRenamed;
-                    _watcher.Dispose();
+                    watcher.EnableRaisingEvents = false;
+                    watcher.Created -= OnTextureFileChanged;
+                    watcher.Changed -= OnTextureFileChanged;
+                    watcher.Deleted -= OnTextureFileChanged;
+                    watcher.Renamed -= OnTextureFileRenamed;
+                    watcher.Dispose();
                 }
                 catch { }
-                _watcher = null;
             }
+            _watchers.Clear();
 
             if (_harmony != null)
             {
@@ -283,26 +320,356 @@ namespace CustomTextureReplacer
             }
         }
 
-        private void InitialiseWatcher()
+        private void RefreshWatchers()
         {
-            _watcher = new FileSystemWatcher(_textureFolder, "*.png")
+            foreach (var watcher in _watchers)
             {
-                NotifyFilter = NotifyFilters.FileName | NotifyFilters.LastWrite,
-                IncludeSubdirectories = false,
-                EnableRaisingEvents = true
-            };
+                try
+                {
+                    watcher.EnableRaisingEvents = false;
+                    watcher.Created -= OnTextureFileChanged;
+                    watcher.Changed -= OnTextureFileChanged;
+                    watcher.Deleted -= OnTextureFileChanged;
+                    watcher.Renamed -= OnTextureFileRenamed;
+                    watcher.Dispose();
+                }
+                catch { }
+            }
 
-            _watcher.Created += OnTextureFileChanged;
-            _watcher.Changed += OnTextureFileChanged;
-            _watcher.Deleted += OnTextureFileChanged;
-            _watcher.Renamed += OnTextureFileRenamed;
-            SafeAppendDebug("FileSystemWatcher initialised.");
+            _watchers.Clear();
+
+            foreach (var folder in _textureFolders)
+            {
+                try
+                {
+                    Directory.CreateDirectory(folder);
+
+                    var watcher = new FileSystemWatcher(folder, "*.png")
+                    {
+                        NotifyFilter = NotifyFilters.FileName | NotifyFilters.LastWrite,
+                        IncludeSubdirectories = false,
+                        EnableRaisingEvents = true
+                    };
+
+                    watcher.Created += OnTextureFileChanged;
+                    watcher.Changed += OnTextureFileChanged;
+                    watcher.Deleted += OnTextureFileChanged;
+                    watcher.Renamed += OnTextureFileRenamed;
+                    _watchers.Add(watcher);
+                }
+                catch (Exception ex)
+                {
+                    _logger?.LogWarning($"[CustomTextureReplacer] Could not watch '{folder}': {ex.Message}");
+                }
+            }
+
+            SafeAppendDebug($"FileSystemWatcher initialised for {_textureFolders.Count} folder(s).");
+        }
+
+        private bool DiscoverTextureFolders(bool logDetails)
+        {
+            var discovered = new List<string>();
+
+            try
+            {
+                var assemblyDir = Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location) ?? Paths.PluginPath;
+                if (!string.IsNullOrEmpty(assemblyDir))
+                {
+                    TryAddTextureFolder(discovered, Path.Combine(assemblyDir, "CustomTextures"), logDetails);
+
+                    var parent = Directory.GetParent(assemblyDir)?.FullName;
+                    if (!string.IsNullOrEmpty(parent))
+                    {
+                        foreach (var child in Directory.GetDirectories(parent))
+                        {
+                            TryAddTextureFolder(discovered, Path.Combine(child, "CustomTextures"), logDetails);
+                        }
+
+                        TryAddTextureFolder(discovered, Path.Combine(parent, "CustomTextures"), logDetails);
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger?.LogWarning($"[CustomTextureReplacer] Unable to discover texture folders: {ex.Message}");
+            }
+
+            if (discovered.Count == 0)
+            {
+                var fallbackRoot = Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location) ?? Paths.PluginPath;
+                var fallback = Path.Combine(fallbackRoot, "CustomTextures");
+                Directory.CreateDirectory(fallback);
+                discovered.Add(Path.GetFullPath(fallback));
+                if (logDetails)
+                    _logger?.LogInfo($"[CustomTextureReplacer] No texture folders found; using default: {discovered[0]}");
+            }
+
+            bool changed = !_textureFolders.SequenceEqual(discovered, StringComparer.OrdinalIgnoreCase);
+            if (changed)
+            {
+                _textureFolders.Clear();
+                _textureFolders.AddRange(discovered);
+
+                if (!logDetails)
+                {
+                    foreach (var folder in _textureFolders)
+                    {
+                        _logger?.LogInfo($"[CustomTextureReplacer] Texture folder: {folder}");
+                    }
+                }
+            }
+
+            return changed;
+        }
+
+        private void UpdatePreferredFolderTokens()
+        {
+            var raw = _preferredFolderHint?.Value ?? string.Empty;
+            if (string.IsNullOrWhiteSpace(raw))
+            {
+                _preferredFolderTokens = Array.Empty<string>();
+                return;
+            }
+
+            _preferredFolderTokens = raw
+                .Split(PreferredFolderSeparators, StringSplitOptions.RemoveEmptyEntries)
+                .Select(token => token.Trim())
+                .Where(token => token.Length > 0)
+                .Select(token => token.Replace('\\', '/').ToLowerInvariant())
+                .ToArray();
+        }
+
+        private bool TryAddTextureFolder(List<string> list, string candidate, bool logDetails)
+        {
+            if (string.IsNullOrEmpty(candidate))
+                return false;
+
+            string fullPath;
+            try
+            {
+                fullPath = Path.GetFullPath(candidate);
+            }
+            catch
+            {
+                return false;
+            }
+
+            if (!Directory.Exists(fullPath))
+                return false;
+
+            if (list.Any(entry => string.Equals(entry, fullPath, StringComparison.OrdinalIgnoreCase)))
+                return false;
+
+            list.Add(fullPath);
+
+            if (logDetails)
+                _logger?.LogInfo($"[CustomTextureReplacer] Found texture folder: {fullPath}");
+
+            return true;
+        }
+
+        private int GetPreferredScore(string path)
+        {
+            if (_preferredFolderTokens.Length == 0)
+                return int.MaxValue;
+
+            var normalised = path.Replace('\\', '/').ToLowerInvariant();
+            for (int i = 0; i < _preferredFolderTokens.Length; i++)
+            {
+                if (normalised.Contains(_preferredFolderTokens[i]))
+                    return i;
+            }
+
+            return int.MaxValue;
+        }
+
+        private static string NormalizePath(string path)
+        {
+            if (string.IsNullOrEmpty(path))
+                return string.Empty;
+
+            try
+            {
+                return Path.GetFullPath(path);
+            }
+            catch
+            {
+                return path;
+            }
+        }
+
+        private void RecordFileEvent(string path)
+        {
+            var key = NormalizePath(path);
+            if (string.IsNullOrEmpty(key))
+                return;
+
+            _fileEventCounter++;
+            _fileEventOrders[key] = _fileEventCounter;
+
+            try
+            {
+                if (File.Exists(key))
+                {
+                    _fileEventTimes[key] = DateTime.UtcNow;
+                }
+                else
+                {
+                    _fileEventTimes.Remove(key);
+                }
+            }
+            catch
+            {
+                _fileEventTimes[key] = DateTime.UtcNow;
+            }
+        }
+
+        private void RemoveFileEvent(string path)
+        {
+            var key = NormalizePath(path);
+            if (string.IsNullOrEmpty(key))
+                return;
+
+            _fileEventTimes.Remove(key);
+            _fileEventOrders.Remove(key);
+        }
+
+        private bool IsBetterCandidate(in TextureCandidate candidate, in TextureCandidate existing)
+        {
+            switch (_folderPriorityMode.Value)
+            {
+                case FolderPriorityMode.LastModified:
+                    {
+                        if (candidate.EventOrder != existing.EventOrder)
+                            return candidate.EventOrder > existing.EventOrder;
+
+                        var cmp = candidate.TimestampUtc.CompareTo(existing.TimestampUtc);
+                        if (cmp != 0)
+                            return cmp > 0;
+                        return candidate.FolderIndex > existing.FolderIndex;
+                    }
+                case FolderPriorityMode.FolderOrder:
+                    {
+                        if (candidate.EventOrder != existing.EventOrder)
+                            return candidate.EventOrder > existing.EventOrder;
+
+                        if (candidate.FolderIndex != existing.FolderIndex)
+                            return candidate.FolderIndex < existing.FolderIndex;
+                        return candidate.TimestampUtc > existing.TimestampUtc;
+                    }
+                case FolderPriorityMode.PreferredFolder:
+                    {
+                        if (candidate.EventOrder != existing.EventOrder)
+                            return candidate.EventOrder > existing.EventOrder;
+
+                        var candidateScore = GetPreferredScore(candidate.Path);
+                        var existingScore = GetPreferredScore(existing.Path);
+                        if (candidateScore != existingScore)
+                            return candidateScore < existingScore;
+
+                        var cmp = candidate.TimestampUtc.CompareTo(existing.TimestampUtc);
+                        if (cmp != 0)
+                            return cmp > 0;
+
+                        return candidate.FolderIndex > existing.FolderIndex;
+                    }
+                default:
+                    return false;
+            }
+        }
+
+        private void LoadCustomTextures()
+        {
+            var candidates = new Dictionary<string, TextureCandidate>(StringComparer.OrdinalIgnoreCase);
+
+            for (int folderIndex = 0; folderIndex < _textureFolders.Count; folderIndex++)
+            {
+                var folder = _textureFolders[folderIndex];
+
+                try
+                {
+                    if (!Directory.Exists(folder))
+                        continue;
+
+                    foreach (var file in Directory.GetFiles(folder, "*.png", SearchOption.TopDirectoryOnly))
+                    {
+                        var name = Path.GetFileNameWithoutExtension(file);
+                        if (string.IsNullOrEmpty(name))
+                            continue;
+
+                        var normalisedPath = NormalizePath(file);
+                        var info = new FileInfo(normalisedPath);
+                        if (!info.Exists)
+                            continue;
+
+                        var timestampTicks = Math.Max(info.LastWriteTimeUtc.Ticks, info.CreationTimeUtc.Ticks);
+                        var timestamp = new DateTime(timestampTicks, DateTimeKind.Utc);
+
+                        if (_fileEventTimes.TryGetValue(normalisedPath, out var eventTimestamp) && eventTimestamp > timestamp)
+                        {
+                            timestamp = eventTimestamp;
+                        }
+
+                        _fileEventOrders.TryGetValue(normalisedPath, out var eventOrder);
+
+                        var candidate = new TextureCandidate
+                        {
+                            Path = normalisedPath,
+                            TimestampUtc = timestamp,
+                            FolderIndex = folderIndex,
+                            EventOrder = eventOrder
+                        };
+
+                        if (candidates.TryGetValue(name, out var existing))
+                        {
+                            if (IsBetterCandidate(candidate, existing))
+                            {
+                                candidates[name] = candidate;
+                            }
+                        }
+                        else
+                        {
+                            candidates[name] = candidate;
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _logger?.LogWarning($"[CustomTextureReplacer] Failed to enumerate '{folder}': {ex.Message}");
+                }
+            }
+
+            foreach (var pair in candidates)
+            {
+                var candidate = pair.Value;
+                var path = candidate.Path;
+                if (TryLoadTexture(path, out var texture) && texture != null)
+                {
+                    _customTextures[pair.Key] = texture;
+                    _customTextureIds.Add(texture.GetInstanceID());
+                }
+
+                _fileEventTimes[path] = candidate.TimestampUtc;
+                if (candidate.EventOrder > 0)
+                {
+                    _fileEventOrders[path] = candidate.EventOrder;
+                }
+            }
         }
 
         private void OnTextureFileChanged(object sender, FileSystemEventArgs e)
         {
             if (!IsPng(e.FullPath))
                 return;
+
+            if (e.ChangeType == WatcherChangeTypes.Deleted)
+            {
+                RemoveFileEvent(e.FullPath);
+            }
+            else
+            {
+                RecordFileEvent(e.FullPath);
+            }
 
             _logger.LogInfo($"[CustomTextureReplacer] Detected change for '{e.Name}'. Reloading custom textures.");
             SafeAppendDebug($"File change detected: {e.Name}");
@@ -313,6 +680,9 @@ namespace CustomTextureReplacer
         {
             if (!IsPng(e.FullPath) && !IsPng(e.OldFullPath))
                 return;
+
+            RemoveFileEvent(e.OldFullPath);
+            RecordFileEvent(e.FullPath);
 
             _logger.LogInfo($"[CustomTextureReplacer] Detected rename from '{e.OldName}' to '{e.Name}'. Reloading custom textures.");
             SafeAppendDebug($"File rename detected: {e.OldName} -> {e.Name}");
@@ -371,18 +741,18 @@ namespace CustomTextureReplacer
             _customTextures.Clear();
             _customTextureIds.Clear();
 
-            foreach (var file in Directory.GetFiles(_textureFolder, "*.png", SearchOption.TopDirectoryOnly))
+            bool foldersChanged = DiscoverTextureFolders(logDetails: false);
+            if (foldersChanged || _watchers.Count == 0)
             {
-                if (TryLoadTexture(file, out var texture))
-                {
-                    _customTextures[Path.GetFileNameWithoutExtension(file)] = texture;
-                    _customTextureIds.Add(texture.GetInstanceID());
-                }
+                RefreshWatchers();
             }
+
+            LoadCustomTextures();
 
             _logger.LogInfo($"[CustomTextureReplacer] Loaded {_customTextures.Count} custom textures from disk.");
             SafeAppendDebug($"ReloadCustomTextures complete: {_customTextures.Count} textures");
             RequestReapply("CustomTexturesReloaded");
+            _overridesDirty = true;
         }
 
         private bool TryLoadTexture(string path, out Texture2D texture)
@@ -749,6 +1119,41 @@ namespace CustomTextureReplacer
             }
         }
 
+        private bool TryCopyIntoTexture(Texture source, Texture2D destination, int width, int height, string label)
+        {
+            if (source == null || destination == null)
+                return false;
+
+            RenderTexture rt = null;
+            var previous = RenderTexture.active;
+
+            try
+            {
+                rt = RenderTexture.GetTemporary(width, height, 0, RenderTextureFormat.ARGB32);
+                Graphics.Blit(source, rt);
+
+                RenderTexture.active = rt;
+                destination.ReadPixels(new Rect(0, 0, width, height), 0, 0);
+                destination.Apply(updateMipmaps: false, makeNoLongerReadable: false);
+
+                RenderTexture.active = previous;
+                SafeAppendDebug($"Override texture refreshed for {label}");
+                return true;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning($"[CustomTextureReplacer] Failed to refresh override for '{label}': {ex.Message}");
+                SafeAppendDebug($"Override refresh failed for {label}: {ex.Message}");
+                return false;
+            }
+            finally
+            {
+                RenderTexture.active = previous;
+                if (rt != null)
+                    RenderTexture.ReleaseTemporary(rt);
+            }
+        }
+
         private bool TryCreateTextureOverride(Texture target, Texture2D replacement, int width, int height)
         {
             if (!(target is Texture2D targetTex) || replacement == null)
@@ -760,8 +1165,15 @@ namespace CustomTextureReplacer
                 {
                     if (existingOverride is Texture2D tex2D && tex2D.width == width && tex2D.height == height)
                     {
-                        _textureOverrides[targetTex] = tex2D;
-                        return true;
+                        if (TryCopyIntoTexture(replacement, tex2D, width, height, targetTex.name))
+                        {
+                            _textureOverrides[targetTex] = tex2D;
+                            _textureOverridesByName[targetTex.name] = tex2D;
+                            _overridesDirty = true;
+                            return true;
+                        }
+
+                        RemoveTextureOverride(targetTex);
                     }
                 }
 
@@ -769,9 +1181,15 @@ namespace CustomTextureReplacer
                 {
                     if (nameOverride is Texture2D tex2D && tex2D.width == width && tex2D.height == height)
                     {
-                        _textureOverrides[targetTex] = tex2D;
-                        _overridesDirty = true;
-                        return true;
+                        if (TryCopyIntoTexture(replacement, tex2D, width, height, targetTex.name))
+                        {
+                            _textureOverrides[targetTex] = tex2D;
+                            _textureOverridesByName[targetTex.name] = tex2D;
+                            _overridesDirty = true;
+                            return true;
+                        }
+
+                        RemoveTextureOverride(targetTex);
                     }
                 }
 
@@ -841,9 +1259,16 @@ namespace CustomTextureReplacer
                     var existingTexture = existing.texture;
                     if (existingTexture != null && existingTexture.width == width && existingTexture.height == height)
                     {
-                        _spriteOverrides[originalSprite] = existing;
-                        _overridesDirty = true;
-                        return true;
+                        if (existingTexture is Texture2D spriteTex && TryCopyIntoTexture(replacement, spriteTex, width, height, originalSprite.name))
+                        {
+                            _spriteOverrides[originalSprite] = existing;
+                            _spriteOverridesByName[originalSprite.name] = existing;
+                            _spriteOverrideTextures[existing] = spriteTex;
+                            _overridesDirty = true;
+                            return true;
+                        }
+
+                        RemoveSpriteOverride(originalSprite.name);
                     }
                 }
 
@@ -1626,6 +2051,17 @@ namespace CustomTextureReplacer
         }
     }
 }
+
+
+
+
+
+
+
+
+
+
+
 
 
 
