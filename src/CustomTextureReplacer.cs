@@ -12,6 +12,8 @@ using UnityEngine.SceneManagement;
 using UnityEngine.U2D;
 using UnityEngine.Experimental.Rendering;
 using System.Reflection;
+using TMPro;
+using UnityEngine.UI;
 namespace CustomTextureReplacer
 {
     [BepInPlugin("com.duckieray.cardshop.customtextures", "Custom Texture Replacer", "1.3.0")]
@@ -19,6 +21,7 @@ namespace CustomTextureReplacer
     {
         private void Awake()
         {
+#pragma warning disable CS0649
             if (ReplacerController.Instance != null)
             {
                 Logger.LogWarning("[CustomTextureReplacer] Controller already initialised");
@@ -81,6 +84,8 @@ namespace CustomTextureReplacer
         private readonly Dictionary<Sprite, Texture2D> _spriteOverrideTextures = new Dictionary<Sprite, Texture2D>();
         private readonly HashSet<Texture2D> _generatedTextures = new HashSet<Texture2D>();
         private readonly HashSet<Sprite> _generatedSprites = new HashSet<Sprite>();
+        private readonly Dictionary<string, CardTextOverride> _cardOverrides = new Dictionary<string, CardTextOverride>(StringComparer.OrdinalIgnoreCase);
+        private readonly Dictionary<string, CardTextOverride> _capturedCardData = new Dictionary<string, CardTextOverride>(StringComparer.OrdinalIgnoreCase);
         private bool _overridesDirty;
         private readonly MaterialPropertyBlock _propertyBlock = new MaterialPropertyBlock();
         private readonly Dictionary<string, DateTime> _fileEventTimes = new Dictionary<string, DateTime>(StringComparer.OrdinalIgnoreCase);
@@ -107,6 +112,9 @@ namespace CustomTextureReplacer
         private ConfigEntry<string> _preferredFolderHint;
         private string[] _preferredFolderTokens = Array.Empty<string>();
         private static readonly char[] PreferredFolderSeparators = new[] { ';', ',', '|' };
+        private string _cardOverridesPath = string.Empty;
+        private bool _cardOverridesReloadRequested;
+        private FileSystemWatcher _cardOverridesWatcher;
 
         private Harmony _harmony;
 
@@ -150,6 +158,9 @@ namespace CustomTextureReplacer
             };
 
             DiscoverTextureFolders(logDetails: true);
+            ResolveCardOverridesPath();
+            LoadCardOverrides(logDetails: true);
+            SetupCardOverridesWatcher();
 
             _dumpFile = Path.Combine(Paths.PluginPath, "TexturesList.txt");
             _dumpTriggerFile = Path.Combine(Paths.PluginPath, "CustomTextures.dump.now");
@@ -193,6 +204,21 @@ namespace CustomTextureReplacer
             }
             _watchers.Clear();
 
+            if (_cardOverridesWatcher != null)
+            {
+                try
+                {
+                    _cardOverridesWatcher.EnableRaisingEvents = false;
+                    _cardOverridesWatcher.Changed -= OnCardOverridesFileChanged;
+                    _cardOverridesWatcher.Created -= OnCardOverridesFileChanged;
+                    _cardOverridesWatcher.Deleted -= OnCardOverridesFileChanged;
+                    _cardOverridesWatcher.Renamed -= OnCardOverridesFileRenamed;
+                    _cardOverridesWatcher.Dispose();
+                }
+                catch { }
+                _cardOverridesWatcher = null;
+            }
+
             if (_harmony != null)
             {
                 try
@@ -216,6 +242,7 @@ namespace CustomTextureReplacer
             _spriteBuffer.Clear();
             _collectionScratch.Clear();
             _spriteScratch.Clear();
+            _cardOverrides.Clear();
 
             foreach (var tex in _generatedTextures)
             {
@@ -277,11 +304,26 @@ namespace CustomTextureReplacer
                 ReloadCustomTextures();
             }
 
+            if (_cardOverridesReloadRequested)
+            {
+                _cardOverridesReloadRequested = false;
+                SafeAppendDebug("Card override reload flag consumed.");
+                LoadCardOverrides(logDetails: true);
+                ReapplyCardOverrides();
+            }
+
             if (Input.GetKeyDown(KeyCode.F8))
             {
                 _logger.LogInfo("[CustomTextureReplacer] Manual dump triggered (F8).");
                 SafeAppendDebug("F8 pressed");
                 DumpAllTextures();
+            }
+
+            if (Input.GetKeyDown(KeyCode.F9))
+            {
+                _logger.LogInfo("[CustomTextureReplacer] Original card data dump requested (F9).");
+                SafeAppendDebug("F9 pressed - dumping original card data.");
+                DumpOriginalCardData();
             }
 
             if (Time.realtimeSinceStartup >= _nextScanTime)
@@ -747,12 +789,20 @@ namespace CustomTextureReplacer
                 RefreshWatchers();
             }
 
+            var overridesPathChanged = ResolveCardOverridesPath();
+            if (overridesPathChanged)
+            {
+                LoadCardOverrides(logDetails: true);
+                SetupCardOverridesWatcher();
+            }
+
             LoadCustomTextures();
 
             _logger.LogInfo($"[CustomTextureReplacer] Loaded {_customTextures.Count} custom textures from disk.");
             SafeAppendDebug($"ReloadCustomTextures complete: {_customTextures.Count} textures");
             RequestReapply("CustomTexturesReloaded");
             _overridesDirty = true;
+            ReapplyCardOverrides();
         }
 
         private bool TryLoadTexture(string path, out Texture2D texture)
@@ -2009,6 +2059,653 @@ namespace CustomTextureReplacer
                 // ignore file IO errors
             }
         }
+
+        private void LoadCardOverrides(bool logDetails)
+        {
+            _cardOverrides.Clear();
+
+            if (string.IsNullOrEmpty(_cardOverridesPath))
+                return;
+
+            if (!File.Exists(_cardOverridesPath))
+            {
+                if (logDetails)
+                    _logger.LogInfo($"[CustomTextureReplacer] Card override file not found at '{_cardOverridesPath}'.");
+                SafeAppendDebug("CardOverrides file missing.");
+                return;
+            }
+
+            try
+            {
+                var json = File.ReadAllText(_cardOverridesPath);
+                if (string.IsNullOrWhiteSpace(json))
+                {
+                    if (logDetails)
+                        _logger.LogInfo($"[CustomTextureReplacer] Card override file '{_cardOverridesPath}' is empty.");
+                    SafeAppendDebug("CardOverrides file empty.");
+                    return;
+                }
+
+                json = json.Trim();
+                SafeAppendDebug($"CardOverrides JSON length: {json.Length}");
+                if (json.StartsWith("[", StringComparison.Ordinal))
+                {
+                    json = "{ \"entries\": " + json + " }";
+                }
+
+                var root = MiniJson.Deserialize(json) as Dictionary<string, object>;
+                if (root == null)
+                {
+                    SafeAppendDebug("CardOverrides JSON root was null or not an object.");
+                }
+                else if (root.TryGetValue("entries", out var entriesObj) && entriesObj is IList entriesList)
+                {
+                    foreach (var entryObj in entriesList)
+                    {
+                        if (entryObj is not Dictionary<string, object> entryDict)
+                            continue;
+
+                        var id = GetString(entryDict, "Id");
+                        if (string.IsNullOrEmpty(id))
+                            continue;
+
+                        var trimmedId = id.Trim();
+                        if (string.IsNullOrEmpty(trimmedId))
+                            continue;
+
+                        var entry = new CardTextOverride
+                        {
+                            Id = trimmedId,
+                            DisplayName = GetString(entryDict, "DisplayName"),
+                            Subtitle = GetString(entryDict, "Subtitle"),
+                            CardNumber = GetString(entryDict, "CardNumber"),
+                            Description = GetString(entryDict, "Description"),
+                            EvolvesFrom = GetString(entryDict, "EvolvesFrom"),
+                            Artist = GetString(entryDict, "Artist"),
+                            Stat1 = GetString(entryDict, "Stat1"),
+                            Stat2 = GetString(entryDict, "Stat2"),
+                            Stat3 = GetString(entryDict, "Stat3"),
+                            Stat4 = GetString(entryDict, "Stat4"),
+                            Rarity = GetString(entryDict, "Rarity"),
+                            Fame = GetString(entryDict, "Fame"),
+                            Aliases = GetStringArray(entryDict, "Aliases")
+                        };
+
+                        _cardOverrides[trimmedId] = entry;
+                        SafeAppendDebug($"CardOverrides added entry for '{trimmedId}'.");
+
+                        if (entry.Aliases != null)
+                        {
+                            foreach (var alias in entry.Aliases)
+                            {
+                                if (string.IsNullOrWhiteSpace(alias))
+                                    continue;
+
+                                var aliasKey = alias.Trim();
+                                if (string.IsNullOrEmpty(aliasKey))
+                                    continue;
+
+                                if (!_cardOverrides.ContainsKey(aliasKey))
+                                {
+                                    _cardOverrides[aliasKey] = entry;
+                                    SafeAppendDebug($"CardOverrides alias '{aliasKey}' mapped to '{trimmedId}'.");
+                                }
+                            }
+                        }
+                    }
+                }
+                else
+                {
+                    SafeAppendDebug("CardOverrides 'entries' array missing or invalid.");
+                }
+
+                if (logDetails)
+                    _logger.LogInfo($"[CustomTextureReplacer] Loaded {_cardOverrides.Count} card override(s) from '{_cardOverridesPath}'.");
+                SafeAppendDebug($"CardOverrides load complete: {_cardOverrides.Count} entries");
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning($"[CustomTextureReplacer] Failed to load card overrides from '{_cardOverridesPath}': {ex.Message}");
+                SafeAppendDebug($"CardOverrides load exception: {ex.Message}");
+            }
+        }
+
+        private static string GetString(Dictionary<string, object> dict, string key)
+        {
+            if (dict == null || string.IsNullOrEmpty(key))
+                return string.Empty;
+
+            if (dict.TryGetValue(key, out var value) && value != null)
+                return value.ToString();
+
+            return string.Empty;
+        }
+
+        private static string[] GetStringArray(Dictionary<string, object> dict, string key)
+        {
+            if (dict == null || string.IsNullOrEmpty(key))
+                return Array.Empty<string>();
+
+            if (!dict.TryGetValue(key, out var value) || value == null)
+                return Array.Empty<string>();
+
+            if (value is IList list)
+            {
+                var result = new List<string>(list.Count);
+                foreach (var item in list)
+                {
+                    if (item == null)
+                        continue;
+                    var s = item.ToString();
+                    if (!string.IsNullOrEmpty(s))
+                        result.Add(s);
+                }
+                return result.ToArray();
+            }
+
+            var single = value.ToString();
+            return string.IsNullOrEmpty(single) ? Array.Empty<string>() : new[] { single };
+        }
+
+        private bool ResolveCardOverridesPath()
+        {
+            var previous = _cardOverridesPath ?? string.Empty;
+            var candidates = new List<string>();
+            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+            void AddCandidate(string candidate)
+            {
+                if (string.IsNullOrWhiteSpace(candidate))
+                    return;
+                if (seen.Add(candidate))
+                    candidates.Add(candidate);
+            }
+
+            if (_textureFolders != null)
+            {
+                foreach (var folder in _textureFolders)
+                {
+                    if (string.IsNullOrWhiteSpace(folder))
+                        continue;
+                    AddCandidate(Path.Combine(folder, "CardOverrides.json"));
+                }
+            }
+
+            AddCandidate(Path.Combine(Paths.PluginPath, "CustomTextures", "CardOverrides.json"));
+
+            var assemblyDir = Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location) ?? Paths.PluginPath;
+            AddCandidate(Path.Combine(assemblyDir, "CardOverrides.json"));
+            AddCandidate(Path.Combine(Paths.PluginPath, "CardOverrides.json"));
+
+            var resolved = candidates.FirstOrDefault(File.Exists) ?? candidates.FirstOrDefault() ?? Path.Combine(Paths.PluginPath, "CardOverrides.json");
+
+            var changed = !string.Equals(previous, resolved, StringComparison.OrdinalIgnoreCase);
+            _cardOverridesPath = resolved;
+
+            if (changed)
+            {
+                SafeAppendDebug($"CardOverrides path set to '{resolved}'.");
+                _logger.LogInfo($"[CustomTextureReplacer] CardOverrides path set to '{resolved}'.");
+            }
+
+            return changed;
+        }
+
+        private void SetupCardOverridesWatcher()
+        {
+            try
+            {
+                if (_cardOverridesWatcher != null)
+                {
+                    _cardOverridesWatcher.EnableRaisingEvents = false;
+                    _cardOverridesWatcher.Changed -= OnCardOverridesFileChanged;
+                    _cardOverridesWatcher.Created -= OnCardOverridesFileChanged;
+                    _cardOverridesWatcher.Deleted -= OnCardOverridesFileChanged;
+                    _cardOverridesWatcher.Renamed -= OnCardOverridesFileRenamed;
+                    _cardOverridesWatcher.Dispose();
+                    _cardOverridesWatcher = null;
+                }
+
+                if (string.IsNullOrEmpty(_cardOverridesPath))
+                    return;
+
+                var directory = Path.GetDirectoryName(_cardOverridesPath);
+                if (string.IsNullOrEmpty(directory))
+                    return;
+
+                Directory.CreateDirectory(directory);
+
+                var fileName = Path.GetFileName(_cardOverridesPath);
+                if (string.IsNullOrEmpty(fileName))
+                    fileName = "CardOverrides.json";
+
+                var watcher = new FileSystemWatcher(directory, fileName)
+                {
+                    NotifyFilter = NotifyFilters.FileName | NotifyFilters.LastWrite
+                };
+
+                watcher.Changed += OnCardOverridesFileChanged;
+                watcher.Created += OnCardOverridesFileChanged;
+                watcher.Deleted += OnCardOverridesFileChanged;
+                watcher.Renamed += OnCardOverridesFileRenamed;
+                watcher.EnableRaisingEvents = true;
+
+                _cardOverridesWatcher = watcher;
+                SafeAppendDebug($"CardOverrides watcher initialised for '{_cardOverridesPath}'.");
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning($"[CustomTextureReplacer] Could not watch card override file: {ex.Message}");
+                SafeAppendDebug($"CardOverrides watcher exception: {ex.Message}");
+            }
+        }
+
+        private void OnCardOverridesFileChanged(object sender, FileSystemEventArgs e)
+        {
+            if (!IsCardOverridesPath(e.FullPath))
+                return;
+
+            _cardOverridesReloadRequested = true;
+        }
+
+        private void OnCardOverridesFileRenamed(object sender, RenamedEventArgs e)
+        {
+            if (IsCardOverridesPath(e.OldFullPath))
+            {
+                _cardOverridesPath = e.FullPath;
+                _cardOverridesReloadRequested = true;
+                SetupCardOverridesWatcher();
+                return;
+            }
+
+            if (IsCardOverridesPath(e.FullPath))
+            {
+                _cardOverridesReloadRequested = true;
+            }
+        }
+
+        private bool IsCardOverridesPath(string candidate)
+        {
+            if (string.IsNullOrEmpty(candidate) || string.IsNullOrEmpty(_cardOverridesPath))
+                return false;
+
+            try
+            {
+                return string.Equals(Path.GetFullPath(candidate), Path.GetFullPath(_cardOverridesPath), StringComparison.OrdinalIgnoreCase);
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private void ReapplyCardOverrides()
+        {
+            if (_cardOverrides.Count == 0)
+                return;
+
+            try
+            {
+                foreach (var cardUI in Resources.FindObjectsOfTypeAll<CardUI>())
+                {
+                    ApplyCardOverrides(cardUI);
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug($"[CustomTextureReplacer] ReapplyCardOverrides failed: {ex.Message}");
+                SafeAppendDebug($"ReapplyCardOverrides exception: {ex.Message}");
+            }
+        }
+
+        internal void ApplyCardOverrides(CardUI cardUI)
+        {
+            if (cardUI == null || _cardOverrides.Count == 0)
+                return;
+
+            try
+            {
+                var key = ResolveMonsterKey(cardUI);
+                if (string.IsNullOrEmpty(key))
+                    return;
+
+                if (!_cardOverrides.TryGetValue(key, out var entry) || entry == null)
+                    return;
+
+                SetCardUIText(cardUI, CardUIBindings.MonsterNameTextField, entry.DisplayName);
+                SetCardUIText(cardUI, CardUIBindings.NumberTextField, entry.CardNumber);
+                SetCardUIText(cardUI, CardUIBindings.SubtitleTextField, entry.Subtitle);
+                SetCardUIText(cardUI, CardUIBindings.DescriptionTextField, entry.Description);
+                SetCardUIText(cardUI, CardUIBindings.ArtistTextField, entry.Artist);
+                SetCardUIText(cardUI, CardUIBindings.RarityTextField, entry.Rarity);
+                SetCardUIText(cardUI, CardUIBindings.FameTextField, entry.Fame);
+                SetCardUIText(cardUI, CardUIBindings.Stat1TextField, entry.Stat1);
+                SetCardUIText(cardUI, CardUIBindings.Stat2TextField, entry.Stat2);
+                SetCardUIText(cardUI, CardUIBindings.Stat3TextField, entry.Stat3);
+                SetCardUIText(cardUI, CardUIBindings.Stat4TextField, entry.Stat4);
+                SetCardUIText(cardUI, CardUIBindings.EvoPreviousStageNameTextField, entry.EvolvesFrom);
+
+                if (CardUIBindings.EvoGroupField?.GetValue(cardUI) is GameObject evoGroup)
+                {
+                    evoGroup.SetActive(!string.IsNullOrEmpty(entry?.EvolvesFrom));
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug($"[CustomTextureReplacer] ApplyCardOverrides failed: {ex.Message}");
+                SafeAppendDebug($"ApplyCardOverrides exception: {ex.Message}");
+            }
+        }
+
+        internal void CaptureCardData(CardUI cardUI)
+        {
+            if (cardUI == null)
+                return;
+
+            var monster = CardUIBindings.MonsterDataField?.GetValue(cardUI);
+            var key = TryGetMemberString(monster, "MonsterType", "monsterType");
+            if (string.IsNullOrEmpty(key))
+                return;
+
+            if (!_capturedCardData.TryGetValue(key, out var snapshot) || snapshot == null)
+            {
+                snapshot = new CardTextOverride { Id = key };
+                _capturedCardData[key] = snapshot;
+                SafeAppendDebug($"Captured baseline card data for '{key}'.");
+            }
+
+            var displayName = TryGetMemberString(monster, "Name", "DisplayName");
+            displayName = Prefer(displayName, TryGetTMPText(cardUI, CardUIBindings.MonsterNameTextField));
+            UpdateIfEmpty(ref snapshot.DisplayName, displayName);
+
+            if ((snapshot.Aliases == null || snapshot.Aliases.Length == 0) && !string.IsNullOrEmpty(snapshot.DisplayName))
+            {
+                snapshot.Aliases = new[] { snapshot.DisplayName };
+            }
+
+            UpdateIfEmpty(ref snapshot.CardNumber, TryGetTMPText(cardUI, CardUIBindings.NumberTextField));
+            UpdateIfEmpty(ref snapshot.Subtitle, Prefer(BuildRolesLabel(monster), TryGetTMPText(cardUI, CardUIBindings.SubtitleTextField)));
+            UpdateIfEmpty(ref snapshot.Description, Prefer(TryGetMemberString(monster, "Description"), TryGetTMPText(cardUI, CardUIBindings.DescriptionTextField)));
+            UpdateIfEmpty(ref snapshot.Artist, Prefer(TryGetMemberString(monster, "ArtistName", "Artist"), TryGetTMPText(cardUI, CardUIBindings.ArtistTextField)));
+            UpdateIfEmpty(ref snapshot.EvolvesFrom, TryGetMemberString(monster, "PreviousEvolution"));
+            UpdateIfEmpty(ref snapshot.Rarity, Prefer(TryGetMemberString(monster, "Rarity"), TryGetTMPText(cardUI, CardUIBindings.RarityTextField)));
+            UpdateIfEmpty(ref snapshot.Fame, Prefer(TryGetMemberString(monster, "ElementIndex"), TryGetTMPText(cardUI, CardUIBindings.FameTextField)));
+
+            var stats = TryGetMemberValue(monster, "BaseStats");
+            UpdateIfEmpty(ref snapshot.Stat1, Prefer(FormatStat(stats, "Strength", "STR"), TryGetTMPText(cardUI, CardUIBindings.Stat1TextField)));
+            UpdateIfEmpty(ref snapshot.Stat2, Prefer(FormatStat(stats, "Magic", "MAG"), TryGetTMPText(cardUI, CardUIBindings.Stat2TextField)));
+            UpdateIfEmpty(ref snapshot.Stat3, Prefer(FormatStat(stats, "Spirit", "SPR"), TryGetTMPText(cardUI, CardUIBindings.Stat3TextField)));
+            UpdateIfEmpty(ref snapshot.Stat4, Prefer(FormatStat(stats, "Speed", "SPD"), TryGetTMPText(cardUI, CardUIBindings.Stat4TextField)));
+        }
+
+        private static void SetCardUIText(CardUI cardUI, FieldInfo field, string value)
+        {
+            if (field == null || cardUI == null)
+                return;
+
+            if (!(field.GetValue(cardUI) is TMP_Text textComponent))
+                return;
+
+            if (string.IsNullOrEmpty(value))
+                return;
+
+            var formatted = value.Replace("\\n", "\n");
+            if (!string.Equals(textComponent.text, formatted, StringComparison.Ordinal))
+            {
+                textComponent.text = formatted;
+            }
+        }
+
+        private void DumpOriginalCardData()
+        {
+            try
+            {
+                if (_capturedCardData.Count == 0)
+                {
+                    _logger.LogWarning("[CustomTextureReplacer] Card override dump skipped - no card data has been captured yet.");
+                    SafeAppendDebug("CardOverrides dump aborted: no captured card data.");
+                    return;
+                }
+
+                var ordered = _capturedCardData.Values
+                    .Where(entry => entry != null && !string.IsNullOrEmpty(entry.Id))
+                    .OrderBy(entry => entry.Id, StringComparer.OrdinalIgnoreCase)
+                    .ToList();
+
+                var entries = new List<Dictionary<string, object>>(ordered.Count);
+                foreach (var entry in ordered)
+                {
+                    entries.Add(ConvertOverrideToDictionary(entry));
+                }
+
+                var root = new Dictionary<string, object>
+                {
+                    ["entries"] = entries
+                };
+
+                var json = MiniJson.Serialize(root);
+                var path = Path.Combine(Paths.PluginPath, "CardOverrides.original.json");
+                File.WriteAllText(path, json);
+                _logger.LogInfo($"[CustomTextureReplacer] Dumped {entries.Count} original card entry/entries to '{path}'.");
+                SafeAppendDebug($"CardOverrides dump complete: {entries.Count} entries -> {path}");
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning($"[CustomTextureReplacer] Card override dump failed: {ex.Message}");
+                SafeAppendDebug($"CardOverrides dump exception: {ex.Message}");
+            }
+        }
+
+        private static string ResolveMonsterKey(CardUI cardUI)
+        {
+            if (cardUI == null)
+                return string.Empty;
+
+            try
+            {
+                if (CardUIBindings.CardDataField?.GetValue(cardUI) is CardData cardData)
+                {
+                    return cardData.monsterType.ToString();
+                }
+
+                if (CardUIBindings.MonsterDataField?.GetValue(cardUI) is MonsterData monsterData)
+                {
+                    return monsterData.MonsterType.ToString();
+                }
+            }
+            catch
+            {
+                // ignore reflection errors
+            }
+
+            return string.Empty;
+        }
+
+        private static class CardUIBindings
+        {
+            internal static readonly FieldInfo CardDataField = AccessTools.Field(typeof(CardUI), "m_CardData");
+            internal static readonly FieldInfo MonsterDataField = AccessTools.Field(typeof(CardUI), "m_MonsterData");
+            internal static readonly FieldInfo MonsterNameTextField = AccessTools.Field(typeof(CardUI), "m_MonsterNameText");
+            internal static readonly FieldInfo NumberTextField = AccessTools.Field(typeof(CardUI), "m_NumberText");
+            internal static readonly FieldInfo SubtitleTextField = AccessTools.Field(typeof(CardUI), "m_ChampionText");
+            internal static readonly FieldInfo DescriptionTextField = AccessTools.Field(typeof(CardUI), "m_DescriptionText");
+            internal static readonly FieldInfo ArtistTextField = AccessTools.Field(typeof(CardUI), "m_ArtistText");
+            internal static readonly FieldInfo RarityTextField = AccessTools.Field(typeof(CardUI), "m_RarityText");
+            internal static readonly FieldInfo FameTextField = AccessTools.Field(typeof(CardUI), "m_FameText");
+            internal static readonly FieldInfo Stat1TextField = AccessTools.Field(typeof(CardUI), "m_Stat1Text");
+            internal static readonly FieldInfo Stat2TextField = AccessTools.Field(typeof(CardUI), "m_Stat2Text");
+            internal static readonly FieldInfo Stat3TextField = AccessTools.Field(typeof(CardUI), "m_Stat3Text");
+            internal static readonly FieldInfo Stat4TextField = AccessTools.Field(typeof(CardUI), "m_Stat4Text");
+            internal static readonly FieldInfo EvoPreviousStageNameTextField = AccessTools.Field(typeof(CardUI), "m_EvoPreviousStageNameText");
+            internal static readonly FieldInfo EvoGroupField = AccessTools.Field(typeof(CardUI), "m_EvoGrp");
+        }
+
+        private class CardTextOverride
+        {
+            public string Id;
+            public string[] Aliases;
+            public string DisplayName;
+            public string Subtitle;
+            public string CardNumber;
+            public string Description;
+            public string EvolvesFrom;
+            public string Artist;
+            public string Stat1;
+            public string Stat2;
+            public string Stat3;
+            public string Stat4;
+            public string Rarity;
+            public string Fame;
+        }
+
+        private static object TryGetMemberValue(object target, string memberName)
+        {
+            if (target == null || string.IsNullOrEmpty(memberName))
+                return null;
+
+            var type = target.GetType();
+            const BindingFlags flags = BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic;
+
+            var field = type.GetField(memberName, flags);
+            if (field != null)
+                return field.GetValue(target);
+
+            var property = type.GetProperty(memberName, flags);
+            return property?.GetValue(target, null);
+        }
+
+        private static string TryGetMemberString(object target, params string[] names)
+        {
+            if (target == null || names == null)
+                return string.Empty;
+
+            foreach (var name in names)
+            {
+                if (string.IsNullOrEmpty(name))
+                    continue;
+
+                var value = TryGetMemberValue(target, name);
+                if (value == null)
+                    continue;
+
+                var str = value.ToString();
+                if (!string.IsNullOrEmpty(str))
+                    return str;
+            }
+
+            return string.Empty;
+        }
+
+        private static string FormatStat(object statsObject, string memberName, string label)
+        {
+            if (statsObject == null || string.IsNullOrEmpty(memberName))
+                return string.Empty;
+
+            var value = TryGetMemberValue(statsObject, memberName);
+            if (value == null)
+                return string.Empty;
+
+            if (value is float f)
+                value = Mathf.RoundToInt(f);
+            else if (value is double d)
+                value = Mathf.RoundToInt((float)d);
+
+            return $"{label}: {value}";
+        }
+
+        private static string BuildRolesLabel(object monster)
+        {
+            var rolesValue = TryGetMemberValue(monster, "Roles");
+            if (rolesValue is IEnumerable enumerable && rolesValue is not string)
+            {
+                var buffer = new List<string>();
+                foreach (var item in enumerable)
+                {
+                    if (item == null)
+                        continue;
+
+                    if (item is string s)
+                    {
+                        if (!string.IsNullOrEmpty(s))
+                            buffer.Add(s);
+                    }
+                    else
+                    {
+                        var name = TryGetMemberString(item, "Name", "DisplayName", "RoleName");
+                        if (!string.IsNullOrEmpty(name))
+                            buffer.Add(name);
+                        else
+                            buffer.Add(item.ToString());
+                    }
+                }
+
+                if (buffer.Count > 0)
+                    return string.Join(", ", buffer);
+            }
+
+            return string.Empty;
+        }
+
+        private static void SetIfNotEmpty(Dictionary<string, object> dictionary, string key, string value)
+        {
+            if (dictionary == null || string.IsNullOrEmpty(key))
+                return;
+
+            if (!string.IsNullOrEmpty(value))
+                dictionary[key] = value;
+        }
+
+        private static string TryGetTMPText(CardUI cardUI, FieldInfo field)
+        {
+            if (cardUI == null || field == null)
+                return string.Empty;
+
+            if (field.GetValue(cardUI) is TMP_Text textComponent)
+            {
+                var value = textComponent.text;
+                if (!string.IsNullOrEmpty(value))
+                    return value.Trim();
+            }
+
+            return string.Empty;
+        }
+
+        private static void UpdateIfEmpty(ref string target, string candidate)
+        {
+            if (string.IsNullOrEmpty(target) && !string.IsNullOrEmpty(candidate))
+                target = candidate;
+        }
+
+        private static string Prefer(string primary, string fallback)
+        {
+            return !string.IsNullOrEmpty(primary) ? primary : fallback;
+        }
+
+        private static Dictionary<string, object> ConvertOverrideToDictionary(CardTextOverride entry)
+        {
+            var dictionary = new Dictionary<string, object>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["Id"] = entry.Id
+            };
+
+            if (entry.Aliases != null && entry.Aliases.Length > 0)
+                dictionary["Aliases"] = entry.Aliases;
+
+            SetIfNotEmpty(dictionary, "DisplayName", entry.DisplayName);
+            SetIfNotEmpty(dictionary, "CardNumber", entry.CardNumber);
+            SetIfNotEmpty(dictionary, "Subtitle", entry.Subtitle);
+            SetIfNotEmpty(dictionary, "Description", entry.Description);
+            SetIfNotEmpty(dictionary, "EvolvesFrom", entry.EvolvesFrom);
+            SetIfNotEmpty(dictionary, "Artist", entry.Artist);
+            SetIfNotEmpty(dictionary, "Stat1", entry.Stat1);
+            SetIfNotEmpty(dictionary, "Stat2", entry.Stat2);
+            SetIfNotEmpty(dictionary, "Stat3", entry.Stat3);
+            SetIfNotEmpty(dictionary, "Stat4", entry.Stat4);
+            SetIfNotEmpty(dictionary, "Rarity", entry.Rarity);
+            SetIfNotEmpty(dictionary, "Fame", entry.Fame);
+
+            return dictionary;
+        }
     }
 
     internal static class ResourceLoadPatches
@@ -2050,7 +2747,31 @@ namespace CustomTextureReplacer
             ReplacerController.Instance?.HandleAssetLoad(__result, $"AssetBundle.LoadAllAssets({type?.Name})");
         }
     }
+
+    [HarmonyPatch(typeof(CardUI))]
+    internal static class CardUIPatches
+    {
+        [HarmonyPostfix]
+        [HarmonyPatch("SetCardUI")]
+        private static void SetCardUIPostfix(CardUI __instance)
+        {
+            var controller = ReplacerController.Instance;
+            if (controller == null || __instance == null)
+                return;
+
+            controller.CaptureCardData(__instance);
+            controller.ApplyCardOverrides(__instance);
+        }
+    }
+
 }
+
+
+
+
+
+
+
 
 
 

@@ -1,97 +1,142 @@
 # Custom Texture Replacer
 
-Custom Texture Replacer lets you swap any in-game texture in **TCG Card Shop Simulator** at runtime. Drop your own PNG assets in the `BepInEx/plugins/CustomTextures` folder and the plugin will discover, resize if needed, and inject them without restarting the game. It is fully compatible with Thunderstore Mod Manager and r2modman.
+Runtime mod for **TCG Card Shop Simulator** that lets you replace textures on the fly, customise card metadata, and export the original data set for reference. No restart requiredódrop files in, press a key, and the game refreshes itself.
 
 ## Features
-- Watches every `CustomTextures` folder under `BepInEx/plugins`, including sibling mod directories, and honours configurable priority rules so duplicate names resolve predictably.
-- Tracks file events so the most recently modified PNG (across all watched folders) is the one injected, keeping rapid iteration reliable.
-- Maintains `BepInEx/plugins/TexturesList.txt` and `SpritesList.txt`, a living index of every texture and sprite discovered during the session.
-- Hooks into Unity asset loading so replacements persist through scene loads, asset bundle fetches, dynamically created sprites, and SpriteAtlas lookups.
-- Handles mismatched resolutions and compressed formats by copying data through a RenderTexture or creating runtime overrides when necessary.
-- Ships with optional debug logging (`BepInEx/plugins/CustomTextureReplacer.debug.log`) for troubleshooting discovery and swap events.
 
-## Requirements
-- TCG Card Shop Simulator (latest Steam build).
-- BepInEx 5.4+ (Mono) installed for the game.
-- Windows has been tested; other OS targets should work so long as BepInEx 5 is available.
+- **Live texture swapping** ñ watches every `CustomTextures` folder under `BepInEx/plugins/` (including sibling mods) and reloads PNGs without restarting the game.
+- **Card metadata overrides** ñ optional `CardOverrides.json` lets you change card names, flavour text, stats, etc. per monster ID.
+- **Hot reloads & watchers** ñ edits to either textures or the override JSON are picked up immediately.
+- **Diagnostics** ñ writes activity to `CustomTextureReplacer.debug.log`, including capture events, alias mapping, and dump status.
+- **Data export helpers** ñ F8 rebuilds the texture/sprite dumps; F9 emits a `CardOverrides.original.json` snapshot of the card data you have viewed.
 
-## Installation
-### Thunderstore Mod Manager / r2modman
-1. Open your manager, select **TCG Card Shop Simulator**, and browse the Thunderstore listing.
-2. Locate **Custom Texture Replacer** and press **Download** (Latest).
-3. Launch the profile; the plugin is enabled automatically on the next game start.
+## Installing / Updating
 
-### Manual installation
-1. Download the release zip and extract it into the game directory so that `CustomTextureReplacer.dll` ends up in `BepInEx/plugins/CustomTextureReplacer`.
-2. Ensure the folder structure looks like:
-   ```
-   TCG Card Shop Simulator/
-     BepInEx/
-       plugins/
-         CustomTextureReplacer/
-           CustomTextureReplacer.dll
-   ```
-3. Start the game once to allow the plugin to create its working folders and configuration file.
+1. Copy `CustomTextureReplacer.dll` to `BepInEx/plugins/CustomTextureReplacer/` (or the r2modman profile equivalent `.../plugins/Duckieray-CustomTextureReplacer/`).
+2. Ensure the companion `MiniJson.cs` is bundled into your buildó`dotnet build` already produces the correct DLL.
+3. Launch the game once to let the plugin create its working files:
+   - `BepInEx/plugins/TexturesList.txt`
+   - `BepInEx/plugins/SpritesList.txt`
+   - `BepInEx/plugins/CustomTextureReplacer.debug.log`
 
-## Usage
-### Dump available texture names
-- On first launch the plugin creates `BepInEx/plugins/TexturesList.txt`, containing every discovered texture name and resolution.
-- Press `F8` in-game or create an empty `BepInEx/plugins/CustomTextures.dump.now` file to regenerate the list at any time.
+> **Tip:** Close the game before copying over the DLL. If the file is ìlocked by a user-mapped sectionî, Windows still has the old binary loaded.
 
-### Replace textures
-1. Open `BepInEx/plugins/TexturesList.txt` and locate the texture you want to override.
-2. Create a PNG that matches the entry (the file name should be identical to the texture name; extension must be `.png`). Matching the resolution listed is strongly recommended.
-3. Place the PNG in `BepInEx/plugins/CustomTextures` (or any other watched `CustomTextures` folder provided by a mod).
-4. The plugin detects changes automatically and reapplies replacements on the fly. You can also force a refresh by creating `BepInEx/plugins/CustomTextures.refresh.now`.
+## Replacing Textures
 
-> Tip: When the replacement PNG resolution differs, the plugin attempts a RenderTexture resize so the swap still succeeds. For best quality, export PNGs at the exact dimensions shown in `TexturesList.txt`.
+1. Inspect `BepInEx/plugins/TexturesList.txt` to find the texture name and resolution.
+2. Drop a PNG with the exact texture name (case-insensitive) into any watched `CustomTextures` folder. The default is `BepInEx/plugins/CustomTextures/`.
+3. The mod automatically reloads the file. Use `CustomTextures.refresh.now` (empty file) or press F8 if you want to force a mass refresh.
 
-### Debugging and logs
-- Runtime status messages are written to `BepInEx/LogOutput.log` and to `BepInEx/plugins/CustomTextureReplacer.debug.log`.
-- Enable verbose discovery output by toggling the debug settings described below.
+PNG names support a rename suffix when the `UseReplacementNames` config flag is enabled:
 
-## Configuration
-Edit `BepInEx/config/com.duckieray.cardshop.customtextures.cfg` after the first run:
+```
+OriginalName-New_Display_Name.png
+```
 
-| Setting | Default | Description |
-|---------|---------|-------------|
-| `LogNewTextureNames` | `true` | Logs the names and resolutions of textures discovered during runtime scans. |
-| `LogAssetLoads` | `true` | Logs when Unity `Resources` or `AssetBundle` APIs load textures or sprites, useful for tracking dynamic assets. |
-| `FolderPriorityMode` | `LastModified` | Controls how duplicate texture names across multiple `CustomTextures` folders are resolved (`LastModified`, `PreferredFolder`, or `FolderOrder`). |
-| `PreferredFolderHint` | *(blank)* | When using `PreferredFolder`, provide folder names or path fragments (separated by `;`, `,`, or `|`) to prioritise. |
+The portion after the first hyphen becomes the fallback display name (underscores are turned into spaces) when no explicit card override is supplied.
 
-Changes take effect immediately; you do not need to restart the game.
+## Editing Card Metadata
 
-## Optional tools
-- `CustomTextureReplacer/replace.py` is a cross-platform helper that batch-copies images from any folder into `CustomTextures`, renaming them to match entries in `TexturesList.txt`. It solves the repetitive work of matching filenames and supports both Windows and Linux installs.
-  - Place your replacement art in a source folder and run `python replace.py <source_folder>` from inside `CustomTextureReplacer/`.
-  - The script locates `TexturesList.txt`, filters textures by size (default `819x1024`), shuffles your images, and drops them into `BepInEx/plugins/CustomTextures` with the correct names.
-  - Use `--size WIDTHxHEIGHT`, `--dump path/to/TexturesList.txt`, or `--output path/to/CustomTextures` to override defaults. Add `--seed <number>` for reproducible shuffles.
-  - Running the script with no arguments prints a help summary that documents every option, making it easy to integrate into your art workflow.
+Create a `CardOverrides.json` with the following structure:
+
+```json
+{
+  "entries": [
+    {
+      "Id": "PiggyA",
+      "Aliases": ["Pigni"],
+      "DisplayName": "Green Lantern",
+      "CardNumber": "01",
+      "Subtitle": "Emerald Guardian",
+      "Description": "Wielder of willpower.\nDefends Sector 2814.",
+      "EvolvesFrom": "Piglet",
+      "Artist": "Hal Jordan",
+      "Stat1": "STR: 150",
+      "Stat2": "MAG: 120",
+      "Stat3": "SPR: 90",
+      "Stat4": "SPD: 80",
+      "Rarity": "Legendary",
+      "Fame": "Justice League"
+    }
+  ]
+}
+```
+
+### Supported Properties
+
+| Key         | Description                                                                 |
+|-------------|-----------------------------------------------------------------------------|
+| `Id`        | Monster ID from `TexturesList.txt` (e.g., `PiggyA`).                         |
+| `Aliases`   | Optional array of extra strings that should match the same card.            |
+| `DisplayName` | Primary title shown on the card.                                           |
+| `CardNumber`  | Top-left number slot (visible on templates that expose it).                |
+| `Subtitle`    | Secondary line (Champion badge) when the template supports it.            |
+| `Description` | Flavour text; use `\n` for manual line breaks.                            |
+| `EvolvesFrom` | Populates the evolution label.                                             |
+| `Artist`      | Artist credit badge.                                                       |
+| `Stat1`ñ`Stat4` | Stat rows at the bottom; supply your own formatted strings.             |
+| `Rarity`      | Rarity badge text.                                                         |
+| `Fame`        | Element/fame badge text.                                                   |
+
+Place `CardOverrides.json` in any watched `CustomTextures` directory. The loader searches in this order:
+
+1. Every discovered `.../CustomTextures/CardOverrides.json`
+2. `BepInEx/plugins/CustomTextureReplacer/CardOverrides.json`
+3. `BepInEx/plugins/CardOverrides.json`
+
+The first file found wins, and the watcher keeps it in sync with on-disk edits.
+
+## Built-in Dumps & Key Bindings
+
+| Key | Action                                                                                                   |
+|-----|----------------------------------------------------------------------------------------------------------|
+| F8  | Rebuilds `TexturesList.txt` and `SpritesList.txt`.                                                       |
+| F9  | Writes `BepInEx/plugins/CardOverrides.original.json` using the *captured* card data (see below).         |
+
+### Card data capture
+
+While you browse the game, each rendered `CardUI` is captured and stored in an in-memory snapshot. The F9 dump simply serialises that snapshot. If you press F9 before visiting any cards, the dump will be emptyóopen the album/packs first to populate the cache.
+
+Each capture is logged in `CustomTextureReplacer.debug.log` as:
+
+```
+[time] Captured baseline card data for 'PiggyA'.
+```
+
+The dump file is a perfect baseline for composing your own overrides.
+
+## Debugging & Logs
+
+- `BepInEx/plugins/CustomTextureReplacer.debug.log` keeps a detailed trace: texture discoveries, override hits, card capture events, alias mappings, and dump status.
+- Use the log to confirm overrides are loading:
+  - `CardOverrides JSON length: ...`
+  - `CardOverrides added entry for '...'`
+  - `CardOverrides load complete: N entries`
 
 ## Troubleshooting
-- **Nothing changes** - Double-check the PNG file name (case-insensitive) matches the entry in `TexturesList.txt` and that the file lives directly inside `BepInEx/plugins/CustomTextures`.
-- **Blurred or stretched textures** - Export replacement art at the exact resolution reported in `TexturesList.txt` to avoid relying on the automatic resize.
-- **Performance hiccups** - Large-scale swaps can be intensive the first time they apply. After the initial pass, only modified textures are reprocessed.
-- **Still stuck?** - Inspect `BepInEx/plugins/CustomTextureReplacer.debug.log` and `BepInEx/LogOutput.log` for warnings; attach them when reporting issues.
 
-## Changelog
-### 1.5.0
-- Refresh existing runtime overrides in place so compressed textures and SpriteAtlas entries update immediately after edits.
-- Preserve ‚Äúlast modified wins‚Äù behaviour across every watched folder by copying new pixel data into overrides before reuse.
-- Tightened multi-folder discovery and priority handling (LastModified, PreferredFolder, FolderOrder) to make duplicate resolution explicit.
+| Symptom / Log Line                                         | Resolution                                                                                   |
+|------------------------------------------------------------|----------------------------------------------------------------------------------------------|
+| ìCould not watch card override fileî                       | Check folder permissions; ensure the directory exists and isnít read-only.                  |
+| ìCard override dump skipped ñ no card data captured yetî   | Navigate through the in-game card views before pressing F9 so the snapshot cache is filled. |
+| `CardOverrides entries were null after deserialisation`    | JSON syntax problemóvalidate the file (no trailing commas, matching braces, etc.).          |
+| Texture swap does nothing                                  | File name mismatch or cached asset; drop a `CustomTextures.refresh.now` trigger or press F8. |
 
-### 1.4.0
-- Added runtime override support for compressed textures and SpriteAtlas entries so posters, UI icons, and other DXT assets can be swapped without artefacts.
-- Apply overrides to materials, renderer property blocks, sprite renderers, and UI images only when assets change to prevent runaway memory usage.
-- Discovered `CustomTextures` folders across sibling mods and introduced priority modes (LastModified, PreferredFolder, FolderOrder).
-- Export command now favours override textures so `CustomTextures.extract.*.now` dumps the in-game artwork.
-- Improved diagnostics around fallback copies and override creation while skipping generated assets during discovery loops.
+## Building from Source
 
-### 1.3.0
-- Initial Thunderstore release featuring automatic folder watching, texture dumps, runtime refresh triggers, and optional debug logging.
+```bash
+# build
+cd CustomTextureReplacer
+ dotnet build
+
+# deploy (example r2modman profile)
+copy build\CustomTextureReplacer.dll "C:\Users\<you>\AppData\Roaming\r2modmanPlus-local\TCGCardShopSimulator\profiles\Default\BepInEx\plugins\Duckieray-CustomTextureReplacer\"
+```
+
+Ensure `Card Shop Simulator_Data/Managed` is accessible so the build references Unity assemblies correctly.
 
 ## Credits
+
 - Plugin author: Duckieray
-- Powered by BepInEx and Harmony
-- GitHub: https://github.com/Duckieray/TCG_CustomTextureReplacer
+- Enhancements & maintenance: community contributors
+- Powered by BepInEx 5 + Harmony 2
