@@ -2060,6 +2060,32 @@ namespace CustomTextureReplacer
             }
         }
 
+        private void RegisterCardOverrideAlias(CardTextOverride entry, string alias, string source)
+        {
+            if (entry == null || string.IsNullOrWhiteSpace(alias))
+                return;
+
+            var trimmed = alias.Trim();
+            if (string.IsNullOrEmpty(trimmed))
+                return;
+
+            if (_cardOverrides.TryGetValue(trimmed, out var existing) && !ReferenceEquals(existing, entry))
+                return;
+
+            if (_cardOverrides.ContainsKey(trimmed))
+                return;
+
+            _cardOverrides[trimmed] = entry;
+            if (!string.IsNullOrEmpty(source))
+            {
+                SafeAppendDebug($"CardOverrides alias '{trimmed}' mapped to '{entry.Id}' via {source}.");
+            }
+            else
+            {
+                SafeAppendDebug($"CardOverrides alias '{trimmed}' mapped to '{entry.Id}'.");
+            }
+        }
+
         private void LoadCardOverrides(bool logDetails)
         {
             _cardOverrides.Clear();
@@ -2134,22 +2160,13 @@ namespace CustomTextureReplacer
                         _cardOverrides[trimmedId] = entry;
                         SafeAppendDebug($"CardOverrides added entry for '{trimmedId}'.");
 
-                        if (entry.Aliases != null)
+                        RegisterCardOverrideAlias(entry, entry.DisplayName, "display");
+
+                        if (entry.Aliases != null && entry.Aliases.Length > 0)
                         {
                             foreach (var alias in entry.Aliases)
                             {
-                                if (string.IsNullOrWhiteSpace(alias))
-                                    continue;
-
-                                var aliasKey = alias.Trim();
-                                if (string.IsNullOrEmpty(aliasKey))
-                                    continue;
-
-                                if (!_cardOverrides.ContainsKey(aliasKey))
-                                {
-                                    _cardOverrides[aliasKey] = entry;
-                                    SafeAppendDebug($"CardOverrides alias '{aliasKey}' mapped to '{trimmedId}'.");
-                                }
+                                RegisterCardOverrideAlias(entry, alias, "alias");
                             }
                         }
                     }
@@ -2157,6 +2174,28 @@ namespace CustomTextureReplacer
                 else
                 {
                     SafeAppendDebug("CardOverrides 'entries' array missing or invalid.");
+                }
+
+                if (_capturedCardData.Count > 0)
+                {
+                    foreach (var snapshot in _capturedCardData.Values)
+                    {
+                        if (snapshot == null || string.IsNullOrEmpty(snapshot.Id))
+                            continue;
+
+                        if (!_cardOverrides.TryGetValue(snapshot.Id, out var overrideEntry) || overrideEntry == null)
+                            continue;
+
+                        RegisterCardOverrideAlias(overrideEntry, snapshot.DisplayName, "capture");
+
+                        if (snapshot.Aliases != null && snapshot.Aliases.Length > 0)
+                        {
+                            foreach (var alias in snapshot.Aliases)
+                            {
+                                RegisterCardOverrideAlias(overrideEntry, alias, "capture");
+                            }
+                        }
+                    }
                 }
 
                 if (logDetails)
@@ -2436,6 +2475,163 @@ namespace CustomTextureReplacer
             UpdateIfEmpty(ref snapshot.Stat2, Prefer(FormatStat(stats, "Magic", "MAG"), TryGetTMPText(cardUI, CardUIBindings.Stat2TextField)));
             UpdateIfEmpty(ref snapshot.Stat3, Prefer(FormatStat(stats, "Spirit", "SPR"), TryGetTMPText(cardUI, CardUIBindings.Stat3TextField)));
             UpdateIfEmpty(ref snapshot.Stat4, Prefer(FormatStat(stats, "Speed", "SPD"), TryGetTMPText(cardUI, CardUIBindings.Stat4TextField)));
+
+            if (_cardOverrides.TryGetValue(key, out var overrideEntry) && overrideEntry != null)
+            {
+                RegisterCardOverrideAlias(overrideEntry, snapshot.DisplayName, "capture");
+
+                if (snapshot.Aliases != null && snapshot.Aliases.Length > 0)
+                {
+                    foreach (var alias in snapshot.Aliases)
+                    {
+                        RegisterCardOverrideAlias(overrideEntry, alias, "capture");
+                    }
+                }
+            }
+        }
+
+        internal void ApplyCheckPricePanelOverrides(CheckPricePanelUI panel)
+        {
+            if (panel == null || _cardOverrides.Count == 0)
+                return;
+
+            try
+            {
+                if (CheckPricePanelUIBindings.NameTextField?.GetValue(panel) is not TMP_Text nameText)
+                    return;
+
+                var originalLabel = nameText.text;
+                var cardUI = CheckPricePanelUIBindings.CardUIField?.GetValue(panel) as CardUI;
+                var entry = FindCardOverride(cardUI, originalLabel);
+                if (entry == null)
+                    return;
+
+                ReplaceNameLabel(nameText, entry, originalLabel);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug($"[CustomTextureReplacer] ApplyCheckPricePanelOverrides failed: {ex.Message}");
+                SafeAppendDebug($"ApplyCheckPricePanelOverrides exception: {ex.Message}");
+            }
+        }
+
+        internal void AdjustCheckoutItemName(UI_CheckoutItemBar itemBar, string originalLabel)
+        {
+            if (itemBar == null || _cardOverrides.Count == 0)
+                return;
+
+            try
+            {
+                if (string.IsNullOrEmpty(originalLabel))
+                    return;
+
+                if (CheckoutItemBarBindings.NameTextField?.GetValue(itemBar) is not TMP_Text nameText)
+                    return;
+
+                var entry = FindCardOverride(null, originalLabel);
+                if (entry == null)
+                    return;
+
+                ReplaceNameLabel(nameText, entry, originalLabel);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug($"[CustomTextureReplacer] AdjustCheckoutItemName failed: {ex.Message}");
+                SafeAppendDebug($"AdjustCheckoutItemName exception: {ex.Message}");
+            }
+        }
+
+        internal void ApplyItemPriceGraphOverrides(ItemPriceGraphScreen screen)
+        {
+            if (screen == null || _cardOverrides.Count == 0)
+                return;
+
+            try
+            {
+                if (ItemPriceGraphScreenBindings.CardNameTextField?.GetValue(screen) is not TMP_Text nameText)
+                    return;
+
+                var originalLabel = nameText.text;
+                var cardUI = ItemPriceGraphScreenBindings.CardUIField?.GetValue(screen) as CardUI;
+                var entry = FindCardOverride(cardUI, originalLabel);
+                if (entry == null)
+                    return;
+
+                ReplaceNameLabel(nameText, entry, originalLabel);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug($"[CustomTextureReplacer] ApplyItemPriceGraphOverrides failed: {ex.Message}");
+                SafeAppendDebug($"ApplyItemPriceGraphOverrides exception: {ex.Message}");
+            }
+        }
+
+        private CardTextOverride FindCardOverride(CardUI cardUI, string label)
+        {
+            if (_cardOverrides.Count == 0)
+                return null;
+
+            if (cardUI != null)
+            {
+                var key = ResolveMonsterKey(cardUI);
+                if (!string.IsNullOrEmpty(key) && _cardOverrides.TryGetValue(key, out var entry) && entry != null)
+                    return entry;
+            }
+
+            var prefix = GetNamePrefix(label);
+            if (!string.IsNullOrEmpty(prefix) && _cardOverrides.TryGetValue(prefix, out var fromLabel) && fromLabel != null)
+                return fromLabel;
+
+            return null;
+        }
+
+        private static string GetNamePrefix(string label)
+        {
+            if (string.IsNullOrEmpty(label))
+                return string.Empty;
+
+            var normalised = label.Replace("\r\n", "\n");
+            var newlineIndex = normalised.IndexOf('\n');
+            if (newlineIndex >= 0)
+            {
+                normalised = normalised.Substring(0, newlineIndex);
+            }
+
+            var separatorIndex = normalised.IndexOf(" - ", StringComparison.Ordinal);
+            var candidate = separatorIndex >= 0 ? normalised.Substring(0, separatorIndex) : normalised;
+            return candidate.Trim();
+        }
+
+        private static string GetNameSuffix(string label)
+        {
+            if (string.IsNullOrEmpty(label))
+                return string.Empty;
+
+            var separatorIndex = label.IndexOf(" - ", StringComparison.Ordinal);
+            return separatorIndex >= 0 ? label.Substring(separatorIndex) : string.Empty;
+        }
+
+        private void ReplaceNameLabel(TMP_Text text, CardTextOverride entry, string originalLabel)
+        {
+            if (text == null || entry == null)
+                return;
+
+            var displayName = entry.DisplayName;
+            if (string.IsNullOrEmpty(displayName))
+                return;
+
+            var baseline = originalLabel;
+            if (string.IsNullOrEmpty(baseline))
+                baseline = text.text;
+
+            var suffix = GetNameSuffix(baseline);
+            var newLabel = string.Concat(displayName, suffix);
+            newLabel = newLabel.Replace("\\n", "\n");
+
+            if (!string.Equals(text.text, newLabel, StringComparison.Ordinal))
+            {
+                text.text = newLabel;
+            }
         }
 
         private static void SetCardUIText(CardUI cardUI, FieldInfo field, string value)
@@ -2538,6 +2734,23 @@ namespace CustomTextureReplacer
             internal static readonly FieldInfo Stat4TextField = AccessTools.Field(typeof(CardUI), "m_Stat4Text");
             internal static readonly FieldInfo EvoPreviousStageNameTextField = AccessTools.Field(typeof(CardUI), "m_EvoPreviousStageNameText");
             internal static readonly FieldInfo EvoGroupField = AccessTools.Field(typeof(CardUI), "m_EvoGrp");
+        }
+
+        private static class CheckPricePanelUIBindings
+        {
+            internal static readonly FieldInfo NameTextField = AccessTools.Field(typeof(CheckPricePanelUI), "m_NameText");
+            internal static readonly FieldInfo CardUIField = AccessTools.Field(typeof(CheckPricePanelUI), "m_CardUI");
+        }
+
+        private static class CheckoutItemBarBindings
+        {
+            internal static readonly FieldInfo NameTextField = AccessTools.Field(typeof(UI_CheckoutItemBar), "m_NameText");
+        }
+
+        private static class ItemPriceGraphScreenBindings
+        {
+            internal static readonly FieldInfo CardNameTextField = AccessTools.Field(typeof(ItemPriceGraphScreen), "m_CardName");
+            internal static readonly FieldInfo CardUIField = AccessTools.Field(typeof(ItemPriceGraphScreen), "m_CardUI");
         }
 
         private class CardTextOverride
@@ -2761,6 +2974,39 @@ namespace CustomTextureReplacer
 
             controller.CaptureCardData(__instance);
             controller.ApplyCardOverrides(__instance);
+        }
+    }
+
+    [HarmonyPatch(typeof(CheckPricePanelUI))]
+    internal static class CheckPricePanelUIPatches
+    {
+        [HarmonyPostfix]
+        [HarmonyPatch("InitCard")]
+        private static void InitCardPostfix(CheckPricePanelUI __instance)
+        {
+            ReplacerController.Instance?.ApplyCheckPricePanelOverrides(__instance);
+        }
+    }
+
+    [HarmonyPatch(typeof(UI_CheckoutItemBar))]
+    internal static class CheckoutItemBarPatches
+    {
+        [HarmonyPostfix]
+        [HarmonyPatch("SetItemName")]
+        private static void SetItemNamePostfix(UI_CheckoutItemBar __instance, string name)
+        {
+            ReplacerController.Instance?.AdjustCheckoutItemName(__instance, name);
+        }
+    }
+
+    [HarmonyPatch(typeof(ItemPriceGraphScreen))]
+    internal static class ItemPriceGraphScreenPatches
+    {
+        [HarmonyPostfix]
+        [HarmonyPatch("ShowCardPriceChart")]
+        private static void ShowCardPriceChartPostfix(ItemPriceGraphScreen __instance)
+        {
+            ReplacerController.Instance?.ApplyItemPriceGraphOverrides(__instance);
         }
     }
 
