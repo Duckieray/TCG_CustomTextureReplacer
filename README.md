@@ -5,11 +5,12 @@ Runtime mod for **TCG Card Shop Simulator** that lets you replace textures on th
 ## Features
 
 - **Live texture swapping** – watches every `CustomTextures` folder under `BepInEx/plugins/` (including sibling mods) and reloads PNGs without restarting the game.
+- **Persistent sprite overrides** – icons dropped into `CustomTextures` stay applied across atlas reloads and UI updates (store thumbnails, card icons, etc.).
 - **Live mesh and material swapping** – point `MeshOverrides.json` at Unity asset bundles to override meshes, skinned meshes, colliders, and renderer materials at runtime.
 - **Mesh-specific texture support** – register extra texture folders for your meshes, or specify per-material texture files that the plugin loads and assigns at runtime.
 - **Card metadata overrides** – optional `CardOverrides.json` lets you change card names, flavour text, stats, etc. per monster ID.
-- **Hot reloads and watchers** – edits to textures, mesh overrides, or the card override JSON are picked up immediately.
-- **Diagnostics** – writes activity to `CustomTextureReplacer.debug.log`, including capture events, alias mapping, and dump status.
+- **Hot reloads and watchers** – edits to textures, mesh overrides, or the card override JSON are picked up immediately, no refresh button required.
+- **Diagnostics** – writes activity to `CustomTextureReplacer.debug.log`, including capture events, alias mapping, UI override hits, and dump status.
 - **Data export helpers** – F8 rebuilds the texture and sprite dumps; F9 emits a `CardOverrides.original.json` snapshot of the card data you have viewed.
 
 ## Installing / Updating
@@ -28,7 +29,7 @@ Runtime mod for **TCG Card Shop Simulator** that lets you replace textures on th
 
 1. Inspect `BepInEx/plugins/TexturesList.txt` to find the texture name and resolution.
 2. Drop a PNG with the exact texture name (case-insensitive) into any watched `CustomTextures` folder. The default is `BepInEx/plugins/CustomTextures/`.
-3. The mod automatically reloads the file. Use `CustomTextures.refresh.now` (empty file) or press F8 if you want to force a mass refresh.
+3. The mod automatically reloads the file. Use `CustomTextures.refresh.now` (empty file) or press F8 if you want to force a mass refresh, but normal icon/atlas swaps no longer require it.
 
 PNG names support a rename suffix when the `UseReplacementNames` config flag is enabled:
 
@@ -41,58 +42,6 @@ The portion after the first hyphen becomes the fallback display name (underscore
 ## Replacing Meshes
 
 Mesh swapping uses Unity asset bundles (built for the same Unity version as the game) plus a `MeshOverrides.json` descriptor. The file can live beside your textures in any watched `CustomTextures` folder, or directly under `BepInEx/plugins/CustomTextureReplacer/`.
-
-```json
-{
-  "textureFolders": [
-    "../Batman"
-  ],
-  "overrides": [
-    {
-      "target": "CounterMesh",
-      "bundle": "Meshes/MyReplacement.bundle",
-      "mesh": "CustomCounter",
-      "applyToMeshFilters": true,
-      "applyToSkinnedMeshRenderers": false,
-      "applyToMeshColliders": true,
-      "materials": [
-        {
-          "slot": 0,
-          "material": "CounterMat",
-          "bundle": "Meshes/MyReplacement.bundle",
-          "textures": [
-            {
-              "property": "_BaseMap",
-              "file": "../Batman/Textures/Counter_Diffuse.png",
-              "wrap": "Repeat"
-            }
-          ]
-        }
-      ],
-      "card": {
-        "displayName": "Armored Counter",
-        "aliases": ["CounterMesh"],
-        "description": "Premium countertop imported from Gotham."
-      }
-    }
-  ]
-}
-```
-
-- `textureFolders` registers additional directories (relative to the JSON) that should be scanned exactly like the regular `CustomTextures` folders. Drop PNGs there and they will auto-reload and participate in the global texture pipeline.
-- `target` matches the original mesh name listed in `MeshesList.txt`.
-- `bundle` is resolved relative to the JSON file (or any watched `CustomTextures` folder / plugin root). Supply the full file name of the asset bundle you exported.
-- `mesh` is the asset name inside the bundle. The loader instantiates it and reuses it for all matching components. Leave it blank to let the loader auto-select the most likely mesh (see below).
-- `applyToMeshFilters`, `applyToSkinnedMeshRenderers`, and `applyToMeshColliders` control where the override runs. They default to `true`, `true`, and `false` respectively.
-- `materials` is optional. Each entry replaces a renderer material slot (`slot` index) with a material loaded from either the same bundle or a per-entry `bundle`. If you omit `materials`, the loader auto-selects the first materials inside the bundle (guided by optional `materialHints`).
-- `textures` (optional) lets you point a material property at a PNG on disk. The plugin loads the texture, applies wrap/filter/aniso overrides, and assigns it to the instantiated material - perfect for meshes that expect new texture assets outside of the bundle.
-- `card` (optional) mirrors `CardOverrides.json`. Supply `displayName`, `aliases`, `description`, etc., and the store/price UI will adopt those values whenever that mesh is shown.
-
-The plugin watches the JSON file, every referenced bundle, and any registered texture folders. Updating any of them schedules a reload. Press F10 or create `MeshesList.dump.now` to rebuild `MeshesList.txt` when you need to confirm original names.
-
-### Auto-selection quick start
-
-Want to skip listing mesh/material names? Just point at the bundle:
 
 ```json
 {
@@ -141,10 +90,10 @@ Create a `CardOverrides.json` with the following structure:
       "Description": "Wielder of willpower.\nDefends Sector 2814.",
       "EvolvesFrom": "Piglet",
       "Artist": "Hal Jordan",
-      "Stat1": "STR: 150",
-      "Stat2": "MAG: 120",
-      "Stat3": "SPR: 90",
-      "Stat4": "SPD: 80",
+      "Stat1": "150",
+      "Stat2": "120",
+      "Stat3": "90",
+      "Stat4": "80",
       "Rarity": "Legendary",
       "Fame": "Justice League"
     }
@@ -201,6 +150,12 @@ Each capture is logged in `CustomTextureReplacer.debug.log` as:
   - `CardOverrides JSON length: ...`
   - `CardOverrides added entry for ...`
   - `MeshOverrides load complete: ...`
+
+### Persistent Sprite / Icon Overrides
+
+- Drop icon PNGs (for example `Icon_PiggyA.png`) into any watched `CustomTextures` folder.
+- The plugin records the atlas region and replacement texture the first time it sees the icon. After that, every atlas or UI assignment (shop thumbnails, UI `Image`/`RawImage`, sprite renderers) is automatically overridden via Harmony hooks—no manual refresh or file touch needed.
+- Successful swaps log entries such as `UI Image override applied (hook): Icon_PiggyA -> Icon_PiggyA_Custom` in `CustomTextureReplacer.debug.log`.
 
 ## Troubleshooting
 

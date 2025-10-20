@@ -162,10 +162,6 @@ namespace CustomTextureReplacer
         private float _nextMeshOverrideScanTime;
         private float _meshOverrideRetryDeadline;
         private bool _meshOverrideRetryLogged;
-        private bool _forceTextureReapplyActive;
-        private float _forcedTextureReapplyDeadline;
-        private float _nextForcedTextureReapplyTime;
-        private float _forcedTextureReapplyInterval = 0.5f;
 
         internal void Initialise(ManualLogSource logger, ConfigFile config)
         {
@@ -336,9 +332,6 @@ namespace CustomTextureReplacer
             _meshCardOverrides.Clear();
             Instance = null;
             _pendingSpriteAtlasReapply.Clear();
-            _forceTextureReapplyActive = false;
-            _forcedTextureReapplyDeadline = 0f;
-            _nextForcedTextureReapplyTime = 0f;
         }
 
         private void Update()
@@ -459,24 +452,6 @@ namespace CustomTextureReplacer
             }
 
             ProcessExtractionRequests();
-
-            if (_forceTextureReapplyActive && Time.realtimeSinceStartup >= _nextForcedTextureReapplyTime)
-            {
-                var now = Time.realtimeSinceStartup;
-                if (now <= _forcedTextureReapplyDeadline)
-                {
-                    if (!_reapplyRequested)
-                    {
-                        RequestReapply("TextureAutoRetry");
-                    }
-                    _nextForcedTextureReapplyTime = now + _forcedTextureReapplyInterval;
-                }
-                else
-                {
-                    _forceTextureReapplyActive = false;
-                    _forcedTextureReapplyDeadline = 0f;
-                }
-            }
 
             if (_overridesDirty)
             {
@@ -877,7 +852,6 @@ namespace CustomTextureReplacer
             SafeAppendDebug($"Scene loaded: {scene.name}");
             _hasDumpedAfterSceneLoad = false;
             StartCoroutine(ApplyReplacementsNextFrame(scene.name));
-            ScheduleTextureReapplyBurst(4f, 0.5f);
         }
 
         private IEnumerator InitialDump()
@@ -951,7 +925,6 @@ namespace CustomTextureReplacer
             _logger.LogInfo($"[CustomTextureReplacer] Loaded {_customTextures.Count} custom textures from disk.");
             SafeAppendDebug($"ReloadCustomTextures complete: {_customTextures.Count} textures");
             RequestReapply("CustomTexturesReloaded");
-            ScheduleTextureReapplyBurst(6f, 0.5f);
             _overridesDirty = true;
             ReapplyCardOverrides();
         }
@@ -3329,22 +3302,6 @@ namespace CustomTextureReplacer
             }
         }
 
-        private void ScheduleTextureReapplyBurst(float durationSeconds = 4f, float intervalSeconds = 0.5f)
-        {
-            if (durationSeconds <= 0f)
-                return;
-
-            var now = Time.realtimeSinceStartup;
-            _forceTextureReapplyActive = true;
-            _forcedTextureReapplyInterval = Mathf.Clamp(intervalSeconds, 0.05f, 2f);
-            var deadlineCandidate = now + durationSeconds;
-            if (deadlineCandidate > _forcedTextureReapplyDeadline)
-                _forcedTextureReapplyDeadline = deadlineCandidate;
-
-            if (_nextForcedTextureReapplyTime <= now)
-                _nextForcedTextureReapplyTime = now;
-        }
-
         private void ApplyMeshOverrides()
         {
             if (!_meshOverridesDirty)
@@ -4112,7 +4069,6 @@ namespace CustomTextureReplacer
                 SafeAppendDebug($"Asset load ({context}) texture {tex.name}");
                 ReapplyPersistentSpriteOverrides(tex);
                 RequestReapply(context);
-                ScheduleTextureReapplyBurst(3f, 0.25f);
             }
             else if (asset is Sprite sprite)
             {
@@ -4128,7 +4084,6 @@ namespace CustomTextureReplacer
                 }
                 ReapplyPersistentSpriteToSprite(sprite);
                 RequestReapply(context);
-                ScheduleTextureReapplyBurst(3f, 0.25f);
             }
             else if (asset is Mesh mesh)
             {
@@ -4140,7 +4095,6 @@ namespace CustomTextureReplacer
                 SafeAppendDebug($"Asset load ({context}) mesh {mesh.name}");
                 ScheduleMeshOverrideReapply(0f);
                 RequestReapply(context);
-                ScheduleTextureReapplyBurst(3f, 0.25f);
             }
             else if (asset is Material material)
             {
@@ -4152,7 +4106,6 @@ namespace CustomTextureReplacer
                 SafeAppendDebug($"Asset load ({context}) material {material.name}");
                 ScheduleMeshOverrideReapply(0f);
                 RequestReapply(context);
-                ScheduleTextureReapplyBurst(3f, 0.25f);
             }
         }
 
@@ -4307,7 +4260,6 @@ namespace CustomTextureReplacer
             ReapplyPersistentSpriteOverridesForAtlas(atlas);
             RequestReapply("SpriteAtlasRegistered");
             ScheduleSpriteAtlasRetry(atlas, MeshOverrideRescanIntervalApplied);
-            ScheduleTextureReapplyBurst(4f, 0.5f);
         }
 
         private void ReapplyExistingSpriteAtlases(string reason)
@@ -4325,7 +4277,6 @@ namespace CustomTextureReplacer
                     SafeAppendDebug($"Sprite atlas available: {atlas.name}");
                     ReapplyPersistentSpriteOverridesForAtlas(atlas);
                     ScheduleSpriteAtlasRetry(atlas, MeshOverrideRescanIntervalApplied);
-                    ScheduleTextureReapplyBurst(4f, 0.5f);
                 }
             }
             catch (Exception ex)
