@@ -68,19 +68,25 @@ Mesh swapping uses Unity asset bundles (built for the same Unity version as the 
             }
           ]
         }
-      ]
+      ],
+      "card": {
+        "displayName": "Armored Counter",
+        "aliases": ["CounterMesh"],
+        "description": "Premium countertop imported from Gotham."
+      }
     }
   ]
 }
 ```
 
-- `textureFolders` registers additional directories (relative to the JSON) that should be scanned exactly like the regular `CustomTextures` folders. Drop PNGs there and they will auto-reload and participate in the global texture replacement pipeline.
+- `textureFolders` registers additional directories (relative to the JSON) that should be scanned exactly like the regular `CustomTextures` folders. Drop PNGs there and they will auto-reload and participate in the global texture pipeline.
 - `target` matches the original mesh name listed in `MeshesList.txt`.
 - `bundle` is resolved relative to the JSON file (or any watched `CustomTextures` folder / plugin root). Supply the full file name of the asset bundle you exported.
 - `mesh` is the asset name inside the bundle. The loader instantiates it and reuses it for all matching components. Leave it blank to let the loader auto-select the most likely mesh (see below).
 - `applyToMeshFilters`, `applyToSkinnedMeshRenderers`, and `applyToMeshColliders` control where the override runs. They default to `true`, `true`, and `false` respectively.
 - `materials` is optional. Each entry replaces a renderer material slot (`slot` index) with a material loaded from either the same bundle or a per-entry `bundle`. If you omit `materials`, the loader auto-selects the first materials inside the bundle (guided by optional `materialHints`).
 - `textures` (optional) lets you point a material property at a PNG on disk. The plugin loads the texture, applies wrap/filter/aniso overrides, and assigns it to the instantiated material - perfect for meshes that expect new texture assets outside of the bundle.
+- `card` (optional) mirrors `CardOverrides.json`. Supply `displayName`, `aliases`, `description`, etc., and the store/price UI will adopt those values whenever that mesh is shown.
 
 The plugin watches the JSON file, every referenced bundle, and any registered texture folders. Updating any of them schedules a reload. Press F10 or create `MeshesList.dump.now` to rebuild `MeshesList.txt` when you need to confirm original names.
 
@@ -108,14 +114,17 @@ The loader picks the most complex mesh in the bundle and assigns enough material
       "target": "PiggyA_Mesh",
       "bundle": "dark_knight_armored.bundle",
       "meshHint": "Armored",
-      "materialHints": ["Body", "Head", "Pack"]
+      "materialHints": ["Body", "Head", "Pack"],
+      "card": {
+        "displayName": "Armored Batman Statue",
+        "aliases": ["Pigni Plushie"]
+      }
     }
   ]
 }
 ```
 
 `meshHint` narrows the auto mesh selection by name (case-insensitive). `materialHints` prioritises materials whose names contain each hint. If the loader still cannot determine a unique mesh or enough materials, it logs a warning so you can fall back to explicit names.
-
 ## Editing Card Metadata
 
 Create a `CardOverrides.json` with the following structure:
@@ -221,3 +230,5 @@ Ensure `Card Shop Simulator_Data/Managed` is accessible so the build references 
 - Plugin author: Duckieray
 - Enhancements and maintenance: community contributors
 - Powered by BepInEx 5 + Harmony 2
+
+
