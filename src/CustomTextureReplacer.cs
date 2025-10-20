@@ -86,6 +86,22 @@ namespace CustomTextureReplacer
         private readonly HashSet<Sprite> _generatedSprites = new HashSet<Sprite>();
         private readonly Dictionary<string, CardTextOverride> _cardOverrides = new Dictionary<string, CardTextOverride>(StringComparer.OrdinalIgnoreCase);
         private readonly Dictionary<string, CardTextOverride> _capturedCardData = new Dictionary<string, CardTextOverride>(StringComparer.OrdinalIgnoreCase);
+        private readonly Dictionary<string, MeshOverrideData> _meshOverridesByTarget = new Dictionary<string, MeshOverrideData>(StringComparer.OrdinalIgnoreCase);
+        private readonly HashSet<string> _meshTextureFolders = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        private readonly Dictionary<int, WeakReference<MeshFilter>> _meshFilterReferences = new Dictionary<int, WeakReference<MeshFilter>>();
+        private readonly Dictionary<int, Mesh> _meshFilterOriginalMeshes = new Dictionary<int, Mesh>();
+        private readonly HashSet<int> _meshFilterOverrideIds = new HashSet<int>();
+        private readonly Dictionary<int, WeakReference<SkinnedMeshRenderer>> _skinnedRendererReferences = new Dictionary<int, WeakReference<SkinnedMeshRenderer>>();
+        private readonly Dictionary<int, Mesh> _skinnedOriginalMeshes = new Dictionary<int, Mesh>();
+        private readonly HashSet<int> _skinnedRendererOverrideIds = new HashSet<int>();
+        private readonly Dictionary<int, WeakReference<MeshCollider>> _meshColliderReferences = new Dictionary<int, WeakReference<MeshCollider>>();
+        private readonly Dictionary<int, Mesh> _meshColliderOriginalMeshes = new Dictionary<int, Mesh>();
+        private readonly HashSet<int> _meshColliderOverrideIds = new HashSet<int>();
+        private readonly Dictionary<int, WeakReference<Renderer>> _rendererReferences = new Dictionary<int, WeakReference<Renderer>>();
+        private readonly Dictionary<int, Material[]> _rendererOriginalMaterials = new Dictionary<int, Material[]>();
+        private readonly HashSet<int> _rendererOverrideIds = new HashSet<int>();
+        private readonly Dictionary<string, AssetBundle> _meshAssetBundles = new Dictionary<string, AssetBundle>(StringComparer.OrdinalIgnoreCase);
+        private readonly Dictionary<string, FileSystemWatcher> _meshBundleWatchers = new Dictionary<string, FileSystemWatcher>(StringComparer.OrdinalIgnoreCase);
         private bool _overridesDirty;
         private readonly MaterialPropertyBlock _propertyBlock = new MaterialPropertyBlock();
         private readonly Dictionary<string, DateTime> _fileEventTimes = new Dictionary<string, DateTime>(StringComparer.OrdinalIgnoreCase);
@@ -106,6 +122,8 @@ namespace CustomTextureReplacer
         private string _spriteDumpTriggerFile = string.Empty;
         private string _debugLogFile = string.Empty;
         private string _exportFolder = string.Empty;
+        private string _meshDumpFile = string.Empty;
+        private string _meshDumpTriggerFile = string.Empty;
 
         private readonly List<FileSystemWatcher> _watchers = new List<FileSystemWatcher>();
         private ConfigEntry<FolderPriorityMode> _folderPriorityMode;
@@ -113,8 +131,11 @@ namespace CustomTextureReplacer
         private string[] _preferredFolderTokens = Array.Empty<string>();
         private static readonly char[] PreferredFolderSeparators = new[] { ';', ',', '|' };
         private string _cardOverridesPath = string.Empty;
+        private string _meshOverridesPath = string.Empty;
         private bool _cardOverridesReloadRequested;
+        private bool _meshOverridesReloadRequested;
         private FileSystemWatcher _cardOverridesWatcher;
+        private FileSystemWatcher _meshOverridesWatcher;
 
         private Harmony _harmony;
 
@@ -124,6 +145,7 @@ namespace CustomTextureReplacer
         private bool _reapplyRequested;
         private bool _loggedHeartbeat;
         private float _nextScanTime;
+        private bool _meshOverridesDirty;
 
         internal void Initialise(ManualLogSource logger, ConfigFile config)
         {
@@ -170,6 +192,8 @@ namespace CustomTextureReplacer
             _debugLogFile = Path.Combine(Paths.PluginPath, "CustomTextureReplacer.debug.log");
             _exportFolder = Path.Combine(Paths.PluginPath, "ExportedTextures");
             Directory.CreateDirectory(_exportFolder);
+            _meshDumpFile = Path.Combine(Paths.PluginPath, "MeshesList.txt");
+            _meshDumpTriggerFile = Path.Combine(Paths.PluginPath, "MeshesList.dump.now");
 
             SafeAppendDebug("Controller initialised.");
 
@@ -219,6 +243,24 @@ namespace CustomTextureReplacer
                 _cardOverridesWatcher = null;
             }
 
+            if (_meshOverridesWatcher != null)
+            {
+                try
+                {
+                    _meshOverridesWatcher.EnableRaisingEvents = false;
+                    _meshOverridesWatcher.Changed -= OnMeshOverridesFileChanged;
+                    _meshOverridesWatcher.Created -= OnMeshOverridesFileChanged;
+                    _meshOverridesWatcher.Deleted -= OnMeshOverridesFileChanged;
+                    _meshOverridesWatcher.Renamed -= OnMeshOverridesFileRenamed;
+                    _meshOverridesWatcher.Dispose();
+                }
+                catch { }
+                _meshOverridesWatcher = null;
+            }
+
+            RevertAllMeshOverrides();
+            DisposeMeshOverrideResources();
+
             if (_harmony != null)
             {
                 try
@@ -263,6 +305,7 @@ namespace CustomTextureReplacer
             _spriteOverrides.Clear();
             _spriteOverridesByName.Clear();
             _spriteOverrideTextures.Clear();
+            _meshTextureFolders.Clear();
             Instance = null;
         }
 
@@ -281,6 +324,7 @@ namespace CustomTextureReplacer
                 SafeAppendDebug("Dump trigger consumed.");
                 DumpAllTextures();
                 DumpAllSprites();
+                DumpAllMeshes();
             }
 
             if (CheckAndConsumeFileTrigger(_refreshTriggerFile))
@@ -295,6 +339,13 @@ namespace CustomTextureReplacer
                 _logger.LogInfo($"[CustomTextureReplacer] Manual sprite dump triggered via '{Path.GetFileName(_spriteDumpTriggerFile)}'.");
                 SafeAppendDebug("Sprite dump trigger consumed.");
                 DumpAllSprites();
+            }
+
+            if (CheckAndConsumeFileTrigger(_meshDumpTriggerFile))
+            {
+                _logger.LogInfo($"[CustomTextureReplacer] Manual mesh dump triggered via '{Path.GetFileName(_meshDumpTriggerFile)}'.");
+                SafeAppendDebug("Mesh dump trigger consumed.");
+                DumpAllMeshes();
             }
 
             if (_reloadRequested)
@@ -312,11 +363,20 @@ namespace CustomTextureReplacer
                 ReapplyCardOverrides();
             }
 
+            if (_meshOverridesReloadRequested)
+            {
+                _meshOverridesReloadRequested = false;
+                SafeAppendDebug("Mesh override reload flag consumed.");
+                LoadMeshOverrides(logDetails: true);
+            }
+
             if (Input.GetKeyDown(KeyCode.F8))
             {
                 _logger.LogInfo("[CustomTextureReplacer] Manual dump triggered (F8).");
                 SafeAppendDebug("F8 pressed");
                 DumpAllTextures();
+                DumpAllSprites();
+                DumpAllMeshes();
             }
 
             if (Input.GetKeyDown(KeyCode.F9))
@@ -324,6 +384,13 @@ namespace CustomTextureReplacer
                 _logger.LogInfo("[CustomTextureReplacer] Original card data dump requested (F9).");
                 SafeAppendDebug("F9 pressed - dumping original card data.");
                 DumpOriginalCardData();
+            }
+
+            if (Input.GetKeyDown(KeyCode.F10))
+            {
+                _logger.LogInfo("[CustomTextureReplacer] Manual mesh dump triggered (F10).");
+                SafeAppendDebug("F10 pressed");
+                DumpAllMeshes();
             }
 
             if (Time.realtimeSinceStartup >= _nextScanTime)
@@ -349,6 +416,7 @@ namespace CustomTextureReplacer
                 SafeAppendDebug("Pending dump executed.");
                 DumpAllTextures();
                 DumpAllSprites();
+                DumpAllMeshes();
             }
 
             ProcessExtractionRequests();
@@ -359,6 +427,8 @@ namespace CustomTextureReplacer
                 ApplyTextureOverridesToMaterials();
                 ApplyTextureOverridesToRenderers();
                 ApplySpriteOverridesToComponents();
+                _meshOverridesDirty = true;
+                ApplyMeshOverrides();
             }
         }
 
@@ -444,6 +514,14 @@ namespace CustomTextureReplacer
                 discovered.Add(Path.GetFullPath(fallback));
                 if (logDetails)
                     _logger?.LogInfo($"[CustomTextureReplacer] No texture folders found; using default: {discovered[0]}");
+            }
+
+            if (_meshTextureFolders.Count > 0)
+            {
+                foreach (var folder in _meshTextureFolders)
+                {
+                    TryAddTextureFolder(discovered, folder, logDetails);
+                }
             }
 
             bool changed = !_textureFolders.SequenceEqual(discovered, StringComparer.OrdinalIgnoreCase);
@@ -750,6 +828,7 @@ namespace CustomTextureReplacer
             SafeAppendDebug("Initial dump coroutine running.");
             DumpAllTextures();
             DumpAllSprites();
+            DumpAllMeshes();
         }
 
         private IEnumerator ApplyReplacementsNextFrame(string sceneName)
@@ -766,6 +845,7 @@ namespace CustomTextureReplacer
                 _hasDumpedAfterSceneLoad = true;
                 SafeAppendDebug("Dumping after scene load.");
                 DumpAllTextures();
+                DumpAllMeshes();
             }
         }
 
@@ -796,7 +876,15 @@ namespace CustomTextureReplacer
                 SetupCardOverridesWatcher();
             }
 
+            var meshOverridesPathChanged = ResolveMeshOverridesPath();
+
             LoadCustomTextures();
+
+            LoadMeshOverrides(logDetails: meshOverridesPathChanged || _meshOverridesByTarget.Count == 0);
+            if (_meshOverridesWatcher == null && !string.IsNullOrEmpty(_meshOverridesPath) || meshOverridesPathChanged)
+            {
+                SetupMeshOverridesWatcher();
+            }
 
             _logger.LogInfo($"[CustomTextureReplacer] Loaded {_customTextures.Count} custom textures from disk.");
             SafeAppendDebug($"ReloadCustomTextures complete: {_customTextures.Count} textures");
@@ -1064,6 +1152,9 @@ namespace CustomTextureReplacer
                 _logger.LogInfo($"[CustomTextureReplacer] Applied replacements. Success: {replaced}, skipped: {skipped}.");
                 SafeAppendDebug($"ReplaceAllTextures finished. Success={replaced} Skipped={skipped}");
             }
+
+            _meshOverridesDirty = true;
+            ApplyMeshOverrides();
         }
         private bool TryBlitToTexture(Texture source, Texture destination, int width, int height, out string extraMessage, out bool usedFallback, int dstX = 0, int dstY = 0)
         {
@@ -1722,6 +1813,1501 @@ namespace CustomTextureReplacer
             }
         }
 
+        private void DumpAllMeshes()
+        {
+            if (string.IsNullOrEmpty(_meshDumpFile))
+                return;
+
+            try
+            {
+                var meshes = Resources.FindObjectsOfTypeAll<Mesh>();
+                var ordered = meshes
+                    .Where(mesh => mesh != null)
+                    .OrderBy(mesh => mesh.name, StringComparer.OrdinalIgnoreCase)
+                    .ToList();
+
+                using var writer = new StreamWriter(_meshDumpFile, false);
+                foreach (var mesh in ordered)
+                {
+                    var vertexCount = mesh != null ? mesh.vertexCount : 0;
+                    var subMeshCount = mesh != null ? mesh.subMeshCount : 0;
+                    writer.WriteLine($"{mesh.name} (vertices: {vertexCount}, subMeshes: {subMeshCount})");
+                }
+
+                _logger.LogInfo($"[CustomTextureReplacer] Dumped mesh list to '{_meshDumpFile}' ({ordered.Count} entries).");
+                SafeAppendDebug($"DumpAllMeshes wrote {ordered.Count} entries");
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning($"[CustomTextureReplacer] Unable to dump meshes: {ex.Message}");
+                SafeAppendDebug($"DumpAllMeshes exception: {ex.Message}");
+            }
+        }
+
+        private bool ResolveMeshOverridesPath()
+        {
+            var previous = _meshOverridesPath ?? string.Empty;
+            var candidates = new List<string>();
+            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+            void AddCandidate(string candidate)
+            {
+                if (string.IsNullOrWhiteSpace(candidate))
+                    return;
+
+                try
+                {
+                    var full = Path.GetFullPath(candidate);
+                    if (seen.Add(full))
+                        candidates.Add(full);
+                }
+                catch
+                {
+                    if (seen.Add(candidate))
+                        candidates.Add(candidate);
+                }
+            }
+
+            if (_textureFolders != null)
+            {
+                foreach (var folder in _textureFolders)
+                {
+                    if (string.IsNullOrWhiteSpace(folder))
+                        continue;
+                    AddCandidate(Path.Combine(folder, "MeshOverrides.json"));
+                }
+            }
+
+            AddCandidate(Path.Combine(Paths.PluginPath, "CustomTextures", "MeshOverrides.json"));
+            AddCandidate(Path.Combine(Paths.PluginPath, "MeshOverrides.json"));
+
+            var resolved = string.Empty;
+            foreach (var candidate in candidates)
+            {
+                try
+                {
+                    if (File.Exists(candidate))
+                    {
+                        resolved = candidate;
+                        break;
+                    }
+                }
+                catch
+                {
+                }
+
+                if (string.IsNullOrEmpty(resolved))
+                    resolved = candidate;
+            }
+
+            if (string.IsNullOrEmpty(resolved))
+            {
+                resolved = Path.Combine(Paths.PluginPath, "MeshOverrides.json");
+            }
+
+            var changed = !string.Equals(previous, resolved, StringComparison.OrdinalIgnoreCase);
+            _meshOverridesPath = resolved;
+
+            if (changed)
+            {
+                SafeAppendDebug($"MeshOverrides path resolved: {_meshOverridesPath}");
+            }
+
+            return changed;
+        }
+
+        private void LoadMeshOverrides(bool logDetails)
+        {
+            SafeAppendDebug("LoadMeshOverrides invoked.");
+
+            RevertAllMeshOverrides();
+            DisposeMeshOverrideResources();
+
+            if (string.IsNullOrEmpty(_meshOverridesPath))
+            {
+                SafeAppendDebug("MeshOverrides path empty; nothing to load.");
+                _meshOverridesDirty = true;
+                RequestReapply("MeshOverridesReloaded");
+                return;
+            }
+
+            var path = _meshOverridesPath;
+            try
+            {
+                path = NormalizePath(path);
+            }
+            catch
+            {
+            }
+
+            if (!File.Exists(path))
+            {
+                if (logDetails)
+                    _logger.LogInfo($"[CustomTextureReplacer] Mesh override file not found at '{path}'.");
+                SafeAppendDebug($"MeshOverrides file not found: {path}");
+                _meshOverridesDirty = true;
+                RequestReapply("MeshOverridesReloaded");
+                return;
+            }
+
+            try
+            {
+                var json = File.ReadAllText(path);
+                var parsed = MiniJson.Deserialize(json);
+
+                IList entries = null;
+                var rootTextureFolderCollector = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                if (parsed is IList list)
+                {
+                    entries = list;
+                }
+                else if (parsed is Dictionary<string, object> dict)
+                {
+                    CollectMeshTextureFolders(dict, "textureFolders", configDirectory: Path.GetDirectoryName(path) ?? Paths.PluginPath, rootTextureFolderCollector);
+                    CollectMeshTextureFolders(dict, "textureFolder", configDirectory: Path.GetDirectoryName(path) ?? Paths.PluginPath, rootTextureFolderCollector);
+
+                    if (dict.TryGetValue("overrides", out var overridesValue) && overridesValue is IList overrideList)
+                    {
+                        entries = overrideList;
+                    }
+                    else if (dict.TryGetValue("entries", out var entriesValue) && entriesValue is IList entryList)
+                    {
+                        entries = entryList;
+                    }
+                }
+
+                entries ??= Array.Empty<object>();
+
+                var configDirectory = Path.GetDirectoryName(path) ?? Paths.PluginPath;
+                int loadedCount = 0;
+
+                 var collectedTextureFolders = new HashSet<string>(rootTextureFolderCollector, StringComparer.OrdinalIgnoreCase);
+
+                foreach (var entryObj in entries)
+                {
+                    if (!(entryObj is Dictionary<string, object> entryDict))
+                        continue;
+
+                    var targetName = GetString(entryDict, "target");
+                    if (string.IsNullOrWhiteSpace(targetName))
+                    {
+                        SafeAppendDebug("MeshOverride entry skipped (missing target).");
+                        continue;
+                    }
+
+                    var meshAssetName = GetString(entryDict, "mesh");
+                    var meshHint = GetString(entryDict, "meshHint");
+                    var materialHints = GetStringArray(entryDict, "materialHints");
+                    var explicitMaterialsSpecified = entryDict.ContainsKey("materials");
+                    var autoSelectMesh = string.IsNullOrWhiteSpace(meshAssetName);
+                    var autoSelectMaterials = !explicitMaterialsSpecified;
+
+                    var bundleReference = GetString(entryDict, "bundle");
+                    string bundlePath = string.Empty;
+                    AssetBundle bundle = null;
+
+                    if (!string.IsNullOrWhiteSpace(bundleReference))
+                    {
+                        if (!TryResolveMeshBundlePath(bundleReference, configDirectory, out bundlePath))
+                        {
+                            _logger.LogWarning($"[CustomTextureReplacer] Could not locate bundle '{bundleReference}' for mesh override '{targetName}'.");
+                            SafeAppendDebug($"MeshOverride bundle not found ({bundleReference}) for {targetName}");
+                            continue;
+                        }
+
+                        bundle = GetOrLoadMeshBundle(bundlePath);
+                        if (bundle == null)
+                        {
+                            _logger.LogWarning($"[CustomTextureReplacer] Failed to load bundle '{bundlePath}' for mesh override '{targetName}'.");
+                            SafeAppendDebug($"MeshOverride bundle load failed: {bundlePath}");
+                            continue;
+                        }
+                    }
+
+                    var data = new MeshOverrideData
+                    {
+                        TargetName = targetName,
+                        MeshAssetName = meshAssetName,
+                        MeshSelectionHint = meshHint,
+                        AutoSelectMesh = autoSelectMesh,
+                        AutoSelectMaterials = autoSelectMaterials,
+                        MaterialSelectionHints = materialHints ?? Array.Empty<string>(),
+                        SourceBundlePath = bundlePath,
+                        ApplyToMeshFilter = GetBool(entryDict, "applyToMeshFilters", true),
+                        ApplyToSkinnedMeshRenderer = GetBool(entryDict, "applyToSkinnedMeshRenderers", true),
+                        ApplyToMeshCollider = GetBool(entryDict, "applyToMeshColliders", false)
+                    };
+
+                    if (data.AutoSelectMesh && bundle == null)
+                    {
+                        _logger.LogWarning($"[CustomTextureReplacer] Mesh override for '{targetName}' requested automatic mesh selection but no bundle was provided.");
+                        SafeAppendDebug($"MeshOverride auto-mesh failed (no bundle) for {targetName}");
+                        continue;
+                    }
+
+                    Mesh sourceMesh = null;
+                    try
+                    {
+                        if (data.AutoSelectMesh)
+                        {
+                            if (!TryAutoSelectMeshFromBundle(data, bundle, logDetails))
+                            {
+                                SafeAppendDebug($"MeshOverride auto-mesh selection failed for {targetName}");
+                                continue;
+                            }
+
+                            meshAssetName = data.MeshAssetName;
+                            data.AutoSelectMesh = false;
+                        }
+
+                        sourceMesh = bundle != null ? bundle.LoadAsset<Mesh>(meshAssetName) : Resources.Load<Mesh>(meshAssetName);
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogWarning($"[CustomTextureReplacer] Exception loading mesh '{meshAssetName}' for '{targetName}': {ex.Message}");
+                        SafeAppendDebug($"MeshOverride load exception ({meshAssetName}): {ex.Message}");
+                        continue;
+                    }
+
+                    if (sourceMesh == null)
+                    {
+                        _logger.LogWarning($"[CustomTextureReplacer] Mesh asset '{meshAssetName}' not found for override '{targetName}'.");
+                        SafeAppendDebug($"MeshOverride missing asset {meshAssetName} for {targetName}");
+                        continue;
+                    }
+
+                    var meshInstance = Instantiate(sourceMesh);
+                    meshInstance.name = targetName;
+
+                    data.MeshInstance = meshInstance;
+
+                    CollectMeshTextureFolders(entryDict, "textureFolders", configDirectory, collectedTextureFolders);
+                    CollectMeshTextureFolders(entryDict, "textureFolder", configDirectory, collectedTextureFolders);
+
+                    if (explicitMaterialsSpecified)
+                    {
+                        PopulateMaterialOverrides(entryDict, configDirectory, bundleReference, data, collectedTextureFolders);
+                    }
+
+                    if (data.AutoSelectMaterials && data.MaterialOverrides.Count == 0)
+                    {
+                        if (!TryAutoPopulateMaterials(data, bundle, meshInstance.subMeshCount, logDetails))
+                        {
+                            SafeAppendDebug($"MeshOverride auto-material selection incomplete for {targetName}");
+                        }
+                    }
+
+                    _meshOverridesByTarget[targetName] = data;
+                    loadedCount++;
+                }
+
+                UpdateMeshTextureFolders(collectedTextureFolders);
+
+                if (logDetails)
+                    _logger.LogInfo($"[CustomTextureReplacer] Loaded {loadedCount} mesh override(s) from '{path}'.");
+                SafeAppendDebug($"MeshOverrides load complete: {loadedCount} entries");
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning($"[CustomTextureReplacer] Failed to load mesh overrides from '{path}': {ex.Message}");
+                SafeAppendDebug($"MeshOverrides load exception: {ex.Message}");
+            }
+
+            _meshOverridesDirty = true;
+            RequestReapply("MeshOverridesReloaded");
+        }
+
+        private void CollectMeshTextureFolders(Dictionary<string, object> dict, string key, string configDirectory, HashSet<string> collector)
+        {
+            if (dict == null || collector == null || string.IsNullOrEmpty(key))
+                return;
+
+            if (!dict.TryGetValue(key, out var value) || value == null)
+                return;
+
+            foreach (var raw in EnumerateStringValues(value))
+            {
+                if (string.IsNullOrWhiteSpace(raw))
+                    continue;
+
+                var resolved = ResolveRelativePath(configDirectory, raw);
+                if (string.IsNullOrEmpty(resolved))
+                    continue;
+
+                if (!Directory.Exists(resolved))
+                {
+                    _logger.LogWarning($"[CustomTextureReplacer] Mesh override texture folder '{raw}' (resolved '{resolved}') not found.");
+                    SafeAppendDebug($"Mesh texture folder missing: {resolved}");
+                    continue;
+                }
+
+                collector.Add(resolved);
+            }
+        }
+
+        private void UpdateMeshTextureFolders(HashSet<string> collected)
+        {
+            collected ??= new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+            if (_meshTextureFolders.SetEquals(collected))
+                return;
+
+            var added = collected.Except(_meshTextureFolders, StringComparer.OrdinalIgnoreCase).ToList();
+            var removed = _meshTextureFolders.Except(collected, StringComparer.OrdinalIgnoreCase).ToList();
+
+            _meshTextureFolders.Clear();
+            foreach (var folder in collected)
+            {
+                _meshTextureFolders.Add(folder);
+            }
+
+            foreach (var folder in added)
+            {
+                SafeAppendDebug($"Mesh texture folder registered: {folder}");
+            }
+
+            foreach (var folder in removed)
+            {
+                SafeAppendDebug($"Mesh texture folder removed: {folder}");
+            }
+
+            _reloadRequested = true;
+        }
+
+        private static IEnumerable<string> EnumerateStringValues(object value)
+        {
+            if (value == null)
+                yield break;
+
+            if (value is string s)
+            {
+                yield return s;
+                yield break;
+            }
+
+            if (value is IList list)
+            {
+                foreach (var item in list)
+                {
+                    if (item == null)
+                        continue;
+                    var text = item.ToString();
+                    if (!string.IsNullOrWhiteSpace(text))
+                        yield return text;
+                }
+                yield break;
+            }
+
+            var fallback = value.ToString();
+            if (!string.IsNullOrWhiteSpace(fallback))
+                yield return fallback;
+        }
+
+        private string ResolveRelativePath(string baseDirectory, string candidate)
+        {
+            if (string.IsNullOrWhiteSpace(candidate))
+                return string.Empty;
+
+            try
+            {
+                if (Path.IsPathRooted(candidate))
+                    return NormalizePath(candidate);
+
+                var root = string.IsNullOrEmpty(baseDirectory) ? Paths.PluginPath : baseDirectory;
+                return NormalizePath(Path.Combine(root, candidate));
+            }
+            catch
+            {
+                return candidate;
+            }
+        }
+
+        private Texture2D LoadExternalTexture(string path, string label, bool logWarnings)
+        {
+            try
+            {
+                using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+                using var ms = new MemoryStream();
+                fs.CopyTo(ms);
+                var data = ms.ToArray();
+
+                var texture = new Texture2D(2, 2, TextureFormat.RGBA32, mipChain: false);
+                if (!ImageConversion.LoadImage(texture, data, markNonReadable: false))
+                {
+                    Destroy(texture);
+                    if (logWarnings)
+                    {
+                        _logger.LogWarning($"[CustomTextureReplacer] Failed to decode external texture '{path}'.");
+                    }
+                    SafeAppendDebug($"External texture decode failed: {path}");
+                    return null;
+                }
+
+                texture.name = label ?? Path.GetFileNameWithoutExtension(path);
+                texture.wrapMode = TextureWrapMode.Clamp;
+                texture.filterMode = FilterMode.Bilinear;
+                return texture;
+            }
+            catch (Exception ex)
+            {
+                if (logWarnings)
+                {
+                    _logger.LogWarning($"[CustomTextureReplacer] Could not load external texture '{path}': {ex.Message}");
+                }
+                SafeAppendDebug($"External texture load exception ({Path.GetFileName(path)}): {ex.Message}");
+                return null;
+            }
+        }
+
+        private void PopulateMaterialOverrides(Dictionary<string, object> entryDict, string configDirectory, string defaultBundleReference, MeshOverrideData data, HashSet<string> textureFolderCollector)
+        {
+            if (entryDict == null || data == null)
+                return;
+
+            if (!entryDict.TryGetValue("materials", out var value) || !(value is IList materials))
+                return;
+
+            foreach (var materialObj in materials)
+            {
+                if (!(materialObj is Dictionary<string, object> materialDict))
+                    continue;
+
+                var slot = GetInt(materialDict, "slot", 0);
+                var assetName = GetString(materialDict, "material");
+                if (string.IsNullOrWhiteSpace(assetName))
+                    assetName = GetString(materialDict, "asset");
+
+                if (string.IsNullOrWhiteSpace(assetName))
+                {
+                    SafeAppendDebug($"Material override skipped for {data.TargetName} (missing material asset).");
+                    continue;
+                }
+
+                var bundleReference = GetString(materialDict, "bundle");
+                if (string.IsNullOrWhiteSpace(bundleReference))
+                    bundleReference = defaultBundleReference;
+
+                string bundlePath = string.Empty;
+                AssetBundle bundle = null;
+                if (!string.IsNullOrWhiteSpace(bundleReference))
+                {
+                    if (!TryResolveMeshBundlePath(bundleReference, configDirectory, out bundlePath))
+                    {
+                        _logger.LogWarning($"[CustomTextureReplacer] Could not locate bundle '{bundleReference}' for material override '{assetName}' (target '{data.TargetName}').");
+                        SafeAppendDebug($"Material override bundle missing ({bundleReference}) for {data.TargetName}");
+                        continue;
+                    }
+
+                    bundle = GetOrLoadMeshBundle(bundlePath);
+                    if (bundle == null)
+                    {
+                        _logger.LogWarning($"[CustomTextureReplacer] Failed to load bundle '{bundlePath}' for material override '{assetName}' (target '{data.TargetName}').");
+                        SafeAppendDebug($"Material override bundle load failed: {bundlePath}");
+                        continue;
+                    }
+                }
+
+                Material sourceMaterial = null;
+                try
+                {
+                    sourceMaterial = bundle != null ? bundle.LoadAsset<Material>(assetName) : Resources.Load<Material>(assetName);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning($"[CustomTextureReplacer] Exception loading material '{assetName}' for '{data.TargetName}': {ex.Message}");
+                    SafeAppendDebug($"Material override load exception ({assetName}): {ex.Message}");
+                    continue;
+                }
+
+                if (sourceMaterial == null)
+                {
+                    _logger.LogWarning($"[CustomTextureReplacer] Material asset '{assetName}' not found for override '{data.TargetName}'.");
+                    SafeAppendDebug($"Material override missing asset {assetName} for {data.TargetName}");
+                    continue;
+                }
+
+                var materialInstance = Instantiate(sourceMaterial);
+                materialInstance.name = $"{data.TargetName}_Material_{slot}";
+
+                var materialOverride = new MaterialOverrideData
+                {
+                    Slot = slot,
+                    MaterialAssetName = assetName,
+                    SourceBundlePath = bundlePath,
+                    MaterialInstance = materialInstance
+                };
+
+                data.MaterialOverrides.Add(materialOverride);
+
+                LoadMaterialTextureOverrides(materialDict, configDirectory, data, materialOverride, textureFolderCollector);
+            }
+        }
+
+        private void LoadMaterialTextureOverrides(Dictionary<string, object> materialDict, string configDirectory, MeshOverrideData meshData, MaterialOverrideData materialOverride, HashSet<string> textureFolderCollector)
+        {
+            if (materialDict == null || materialOverride == null || materialOverride.MaterialInstance == null)
+                return;
+
+            if (!materialDict.TryGetValue("textures", out var texturesValue) || texturesValue == null)
+                return;
+
+            IList texturesList = texturesValue as IList;
+            if (texturesList == null)
+            {
+                texturesList = new ArrayList { texturesValue };
+            }
+
+            foreach (var textureObj in texturesList)
+            {
+                if (!(textureObj is Dictionary<string, object> textureDict))
+                    continue;
+
+                var propertyName = GetString(textureDict, "property");
+                if (string.IsNullOrWhiteSpace(propertyName))
+                    propertyName = "_MainTex";
+
+                var fileValue = GetString(textureDict, "file");
+                if (string.IsNullOrWhiteSpace(fileValue))
+                {
+                    _logger.LogWarning($"[CustomTextureReplacer] Material override '{meshData?.TargetName}' texture entry missing 'file'.");
+                    SafeAppendDebug($"Material texture override missing file for {meshData?.TargetName}");
+                    continue;
+                }
+
+                var resolvedPath = ResolveRelativePath(configDirectory, fileValue);
+                if (string.IsNullOrEmpty(resolvedPath) || !File.Exists(resolvedPath))
+                {
+                    _logger.LogWarning($"[CustomTextureReplacer] Material override texture file '{fileValue}' (resolved '{resolvedPath}') not found for '{meshData?.TargetName}'.");
+                    SafeAppendDebug($"Material texture file missing: {resolvedPath}");
+                    continue;
+                }
+
+                var texture = LoadExternalTexture(resolvedPath, $"{meshData?.TargetName}_{Path.GetFileNameWithoutExtension(resolvedPath)}", logWarnings: true);
+                if (texture == null)
+                    continue;
+
+                if (textureDict.TryGetValue("wrap", out var wrapValue))
+                {
+                    var wrapText = wrapValue?.ToString();
+                    if (TryParseTextureWrapMode(wrapText, out var wrapMode))
+                    {
+                        texture.wrapMode = wrapMode;
+                    }
+                }
+
+                if (textureDict.TryGetValue("filter", out var filterValue))
+                {
+                    var filterText = filterValue?.ToString();
+                    if (TryParseFilterMode(filterText, out var filterMode))
+                    {
+                        texture.filterMode = filterMode;
+                    }
+                }
+
+                if (textureDict.TryGetValue("anisoLevel", out var anisoValue))
+                {
+                    var anisoText = anisoValue?.ToString();
+                    if (int.TryParse(anisoText, out var aniso) && aniso >= 0)
+                    {
+                        texture.anisoLevel = aniso;
+                    }
+                }
+
+                if (!materialOverride.MaterialInstance.HasProperty(propertyName))
+                {
+                    _logger.LogWarning($"[CustomTextureReplacer] Material '{materialOverride.MaterialAssetName}' does not have property '{propertyName}'.");
+                    SafeAppendDebug($"Material property missing ({propertyName}) on {materialOverride.MaterialAssetName}");
+                }
+                else
+                {
+                    materialOverride.MaterialInstance.SetTexture(propertyName, texture);
+                }
+
+                var assignment = new MaterialTextureAssignment
+                {
+                    PropertyName = propertyName,
+                    FilePath = resolvedPath,
+                    Texture = texture
+                };
+
+                materialOverride.TextureAssignments.Add(assignment);
+                var directory = Path.GetDirectoryName(resolvedPath);
+                if (!string.IsNullOrEmpty(directory))
+                {
+                    textureFolderCollector?.Add(directory);
+                }
+            }
+        }
+
+        private bool TryAutoSelectMeshFromBundle(MeshOverrideData data, AssetBundle bundle, bool logDetails)
+        {
+            if (data == null || bundle == null)
+                return false;
+
+            Mesh[] meshes;
+            try
+            {
+                meshes = bundle.LoadAllAssets<Mesh>();
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning($"[CustomTextureReplacer] Failed to enumerate meshes in bundle '{GetBundleDebugName(data.SourceBundlePath, bundle)}': {ex.Message}");
+                SafeAppendDebug($"Auto mesh scan failed for {data.TargetName}: {ex.Message}");
+                return false;
+            }
+
+            if (meshes == null || meshes.Length == 0)
+            {
+                _logger.LogWarning($"[CustomTextureReplacer] Bundle '{GetBundleDebugName(data.SourceBundlePath, bundle)}' does not contain any Mesh assets for target '{data.TargetName}'.");
+                SafeAppendDebug($"Auto mesh selection failed (no meshes) for {data.TargetName}");
+                return false;
+            }
+
+            var candidate = SelectBestMeshCandidate(meshes, data.MeshSelectionHint, data.TargetName);
+            if (candidate == null)
+            {
+                _logger.LogWarning($"[CustomTextureReplacer] Unable to auto-select a mesh from bundle '{GetBundleDebugName(data.SourceBundlePath, bundle)}' for target '{data.TargetName}'. Provide 'mesh' or 'meshHint' in MeshOverrides.json.");
+                SafeAppendDebug($"Auto mesh selection could not determine candidate for {data.TargetName}");
+                return false;
+            }
+
+            data.MeshAssetName = candidate.name;
+            if (logDetails)
+            {
+                _logger.LogInfo($"[CustomTextureReplacer] Auto-selected mesh '{data.MeshAssetName}' from bundle '{GetBundleDebugName(data.SourceBundlePath, bundle)}' for target '{data.TargetName}'.");
+            }
+            SafeAppendDebug($"Auto mesh selected '{candidate.name}' for {data.TargetName}");
+            return true;
+        }
+
+        private Mesh SelectBestMeshCandidate(IEnumerable<Mesh> meshes, string hint, string targetName)
+        {
+            if (meshes == null)
+                return null;
+
+            Mesh candidate = null;
+            var ordered = meshes
+                .Where(mesh => mesh != null)
+                .OrderByDescending(mesh => mesh.vertexCount)
+                .ToList();
+
+            if (!string.IsNullOrWhiteSpace(hint))
+            {
+                candidate = ordered.FirstOrDefault(mesh => mesh.name.IndexOf(hint, StringComparison.OrdinalIgnoreCase) >= 0);
+                if (candidate != null)
+                    return candidate;
+            }
+
+            if (!string.IsNullOrWhiteSpace(targetName))
+            {
+                candidate = ordered.FirstOrDefault(mesh => mesh.name.IndexOf(targetName, StringComparison.OrdinalIgnoreCase) >= 0);
+                if (candidate != null)
+                    return candidate;
+            }
+
+            if (ordered.Count == 1)
+                return ordered[0];
+
+            candidate = ordered.FirstOrDefault(mesh =>
+                !mesh.name.EndsWith("Collider", StringComparison.OrdinalIgnoreCase) &&
+                !mesh.name.EndsWith("_LOD1", StringComparison.OrdinalIgnoreCase) &&
+                !mesh.name.EndsWith("_LOD2", StringComparison.OrdinalIgnoreCase));
+
+            return candidate ?? ordered.First();
+        }
+
+        private bool TryAutoPopulateMaterials(MeshOverrideData data, AssetBundle bundle, int subMeshCount, bool logDetails)
+        {
+            if (data == null || bundle == null)
+                return false;
+
+            Material[] materials;
+            try
+            {
+                materials = bundle.LoadAllAssets<Material>();
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning($"[CustomTextureReplacer] Failed to enumerate materials in bundle '{GetBundleDebugName(data.SourceBundlePath, bundle)}': {ex.Message}");
+                SafeAppendDebug($"Auto material scan failed for {data.TargetName}: {ex.Message}");
+                return false;
+            }
+
+            if (materials == null || materials.Length == 0)
+            {
+                _logger.LogWarning($"[CustomTextureReplacer] Bundle '{GetBundleDebugName(data.SourceBundlePath, bundle)}' does not contain any Material assets for target '{data.TargetName}'.");
+                SafeAppendDebug($"Auto material selection failed (no materials) for {data.TargetName}");
+                return false;
+            }
+
+            var selection = new List<Material>();
+            if (data.MaterialSelectionHints != null)
+            {
+                foreach (var hint in data.MaterialSelectionHints)
+                {
+                    if (string.IsNullOrWhiteSpace(hint))
+                        continue;
+                    var match = materials.FirstOrDefault(mat => mat != null && mat.name.IndexOf(hint, StringComparison.OrdinalIgnoreCase) >= 0);
+                    if (match != null && !selection.Contains(match))
+                        selection.Add(match);
+                }
+            }
+
+            foreach (var mat in materials)
+            {
+                if (mat != null && !selection.Contains(mat))
+                    selection.Add(mat);
+            }
+
+            if (subMeshCount <= 0)
+                subMeshCount = 1;
+
+            var required = Math.Min(selection.Count, subMeshCount);
+            if (required == 0)
+            {
+                _logger.LogWarning($"[CustomTextureReplacer] Unable to auto-select materials from bundle '{GetBundleDebugName(data.SourceBundlePath, bundle)}' for target '{data.TargetName}'. Provide explicit 'materials' or 'materialHints'.");
+                SafeAppendDebug($"Auto material selection produced no candidates for {data.TargetName}");
+                return false;
+            }
+
+            for (int slot = 0; slot < required; slot++)
+            {
+                var materialAsset = selection[slot];
+                if (materialAsset == null)
+                    continue;
+                AddMaterialOverrideFromAsset(data, materialAsset, slot, logDetails);
+            }
+
+            data.AutoSelectMaterials = false;
+            return true;
+        }
+
+        private void AddMaterialOverrideFromAsset(MeshOverrideData data, Material sourceMaterial, int slot, bool logDetails)
+        {
+            if (data == null || sourceMaterial == null)
+                return;
+
+            Material instance = null;
+            try
+            {
+                instance = Instantiate(sourceMaterial);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning($"[CustomTextureReplacer] Failed to instantiate material '{sourceMaterial.name}' for '{data.TargetName}': {ex.Message}");
+                SafeAppendDebug($"Auto material instantiate failed for {sourceMaterial.name}: {ex.Message}");
+                return;
+            }
+
+            instance.name = sourceMaterial.name;
+
+            var materialOverride = new MaterialOverrideData
+            {
+                Slot = slot,
+                MaterialAssetName = sourceMaterial.name,
+                SourceBundlePath = data.SourceBundlePath,
+                MaterialInstance = instance
+            };
+
+            data.MaterialOverrides.Add(materialOverride);
+
+            if (logDetails)
+            {
+                _logger.LogInfo($"[CustomTextureReplacer] Auto-selected material '{sourceMaterial.name}' for slot {slot} (target '{data.TargetName}').");
+            }
+
+            SafeAppendDebug($"Auto material selected '{sourceMaterial.name}' (slot {slot}) for {data.TargetName}");
+        }
+
+        private static string GetBundleDebugName(string path, AssetBundle bundle)
+        {
+            if (bundle != null && !string.IsNullOrEmpty(bundle.name))
+                return bundle.name;
+
+            if (!string.IsNullOrEmpty(path))
+                return Path.GetFileName(path);
+
+            return "<bundle>";
+        }
+
+        private static bool TryParseTextureWrapMode(string value, out TextureWrapMode mode)
+        {
+            if (!string.IsNullOrEmpty(value) && Enum.TryParse(value, ignoreCase: true, out mode))
+                return true;
+            mode = TextureWrapMode.Clamp;
+            return false;
+        }
+
+        private static bool TryParseFilterMode(string value, out FilterMode mode)
+        {
+            if (!string.IsNullOrEmpty(value) && Enum.TryParse(value, ignoreCase: true, out mode))
+                return true;
+            mode = FilterMode.Bilinear;
+            return false;
+        }
+
+        private void SetupMeshOverridesWatcher()
+        {
+            if (string.IsNullOrEmpty(_meshOverridesPath))
+                return;
+
+            try
+            {
+                if (_meshOverridesWatcher != null)
+                {
+                    _meshOverridesWatcher.EnableRaisingEvents = false;
+                    _meshOverridesWatcher.Changed -= OnMeshOverridesFileChanged;
+                    _meshOverridesWatcher.Created -= OnMeshOverridesFileChanged;
+                    _meshOverridesWatcher.Deleted -= OnMeshOverridesFileChanged;
+                    _meshOverridesWatcher.Renamed -= OnMeshOverridesFileRenamed;
+                    _meshOverridesWatcher.Dispose();
+                    _meshOverridesWatcher = null;
+                }
+
+                var directory = Path.GetDirectoryName(_meshOverridesPath);
+                var filename = Path.GetFileName(_meshOverridesPath);
+                if (string.IsNullOrEmpty(directory) || string.IsNullOrEmpty(filename))
+                    return;
+
+                Directory.CreateDirectory(directory);
+
+                var watcher = new FileSystemWatcher(directory, filename)
+                {
+                    IncludeSubdirectories = false,
+                    NotifyFilter = NotifyFilters.FileName | NotifyFilters.LastWrite | NotifyFilters.Size
+                };
+
+                watcher.Changed += OnMeshOverridesFileChanged;
+                watcher.Created += OnMeshOverridesFileChanged;
+                watcher.Deleted += OnMeshOverridesFileChanged;
+                watcher.Renamed += OnMeshOverridesFileRenamed;
+                watcher.EnableRaisingEvents = true;
+
+                _meshOverridesWatcher = watcher;
+                SafeAppendDebug($"MeshOverrides watcher initialised for '{_meshOverridesPath}'.");
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning($"[CustomTextureReplacer] Could not watch mesh override file: {ex.Message}");
+                SafeAppendDebug($"MeshOverrides watcher exception: {ex.Message}");
+            }
+        }
+
+        private void OnMeshOverridesFileChanged(object sender, FileSystemEventArgs e)
+        {
+            if (!IsMeshOverridesPath(e.FullPath))
+                return;
+
+            _meshOverridesReloadRequested = true;
+        }
+
+        private void OnMeshOverridesFileRenamed(object sender, RenamedEventArgs e)
+        {
+            if (IsMeshOverridesPath(e.OldFullPath))
+            {
+                _meshOverridesPath = e.FullPath;
+                _meshOverridesReloadRequested = true;
+                SetupMeshOverridesWatcher();
+                return;
+            }
+
+            if (IsMeshOverridesPath(e.FullPath))
+            {
+                _meshOverridesReloadRequested = true;
+            }
+        }
+
+        private bool IsMeshOverridesPath(string candidate)
+        {
+            if (string.IsNullOrEmpty(candidate) || string.IsNullOrEmpty(_meshOverridesPath))
+                return false;
+
+            try
+            {
+                return string.Equals(Path.GetFullPath(candidate), Path.GetFullPath(_meshOverridesPath), StringComparison.OrdinalIgnoreCase);
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private bool TryResolveMeshBundlePath(string bundleReference, string baseDirectory, out string resolvedPath)
+        {
+            resolvedPath = string.Empty;
+            if (string.IsNullOrWhiteSpace(bundleReference))
+                return false;
+
+            var candidates = new List<string>();
+
+            if (Path.IsPathRooted(bundleReference))
+            {
+                candidates.Add(bundleReference);
+            }
+            else
+            {
+                if (!string.IsNullOrEmpty(baseDirectory))
+                    candidates.Add(Path.Combine(baseDirectory, bundleReference));
+
+                if (_textureFolders != null)
+                {
+                    foreach (var folder in _textureFolders)
+                    {
+                        if (string.IsNullOrWhiteSpace(folder))
+                            continue;
+                        candidates.Add(Path.Combine(folder, bundleReference));
+                    }
+                }
+
+                candidates.Add(Path.Combine(Paths.PluginPath, bundleReference));
+            }
+
+            foreach (var candidate in candidates)
+            {
+                try
+                {
+                    var full = NormalizePath(candidate);
+                    if (File.Exists(full))
+                    {
+                        resolvedPath = full;
+                        return true;
+                    }
+                }
+                catch
+                {
+                }
+            }
+
+            return false;
+        }
+
+        private AssetBundle GetOrLoadMeshBundle(string fullPath)
+        {
+            if (string.IsNullOrEmpty(fullPath))
+                return null;
+
+            if (_meshAssetBundles.TryGetValue(fullPath, out var cached) && cached != null)
+                return cached;
+
+            try
+            {
+                var bundle = AssetBundle.LoadFromFile(fullPath);
+                if (bundle == null)
+                    return null;
+
+                _meshAssetBundles[fullPath] = bundle;
+                RegisterMeshBundleWatcher(fullPath);
+                SafeAppendDebug($"Mesh bundle loaded: {fullPath}");
+                return bundle;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning($"[CustomTextureReplacer] Failed to load asset bundle '{fullPath}': {ex.Message}");
+                SafeAppendDebug($"Mesh bundle load exception ({Path.GetFileName(fullPath)}): {ex.Message}");
+                return null;
+            }
+        }
+
+        private void RegisterMeshBundleWatcher(string bundlePath)
+        {
+            if (string.IsNullOrEmpty(bundlePath))
+                return;
+
+            if (_meshBundleWatchers.ContainsKey(bundlePath))
+                return;
+
+            try
+            {
+                var directory = Path.GetDirectoryName(bundlePath);
+                var filename = Path.GetFileName(bundlePath);
+                if (string.IsNullOrEmpty(directory) || string.IsNullOrEmpty(filename))
+                    return;
+
+                var watcher = new FileSystemWatcher(directory, filename)
+                {
+                    IncludeSubdirectories = false,
+                    NotifyFilter = NotifyFilters.FileName | NotifyFilters.LastWrite | NotifyFilters.Size
+                };
+
+                watcher.Changed += OnMeshBundleFileChanged;
+                watcher.Created += OnMeshBundleFileChanged;
+                watcher.Deleted += OnMeshBundleFileChanged;
+                watcher.Renamed += OnMeshBundleFileRenamed;
+                watcher.EnableRaisingEvents = true;
+
+                _meshBundleWatchers[bundlePath] = watcher;
+                SafeAppendDebug($"Mesh bundle watcher initialised for '{bundlePath}'.");
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning($"[CustomTextureReplacer] Could not watch mesh bundle '{bundlePath}': {ex.Message}");
+                SafeAppendDebug($"Mesh bundle watcher exception ({Path.GetFileName(bundlePath)}): {ex.Message}");
+            }
+        }
+
+        private void OnMeshBundleFileChanged(object sender, FileSystemEventArgs e)
+        {
+            _meshOverridesReloadRequested = true;
+        }
+
+        private void OnMeshBundleFileRenamed(object sender, RenamedEventArgs e)
+        {
+            _meshOverridesReloadRequested = true;
+        }
+
+        private void DisposeMeshOverrideResources()
+        {
+            foreach (var entry in _meshOverridesByTarget.Values)
+            {
+                if (entry?.MeshInstance != null)
+                {
+                    Destroy(entry.MeshInstance);
+                }
+
+                if (entry?.MaterialOverrides != null)
+                {
+                    foreach (var materialOverride in entry.MaterialOverrides)
+                    {
+                        if (materialOverride?.MaterialInstance != null)
+                        {
+                            Destroy(materialOverride.MaterialInstance);
+                        }
+
+                        if (materialOverride?.TextureAssignments != null)
+                        {
+                            foreach (var assignment in materialOverride.TextureAssignments)
+                            {
+                                if (assignment?.Texture != null)
+                                {
+                                    Destroy(assignment.Texture);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            _meshOverridesByTarget.Clear();
+
+            foreach (var bundle in _meshAssetBundles.Values)
+            {
+                try
+                {
+                    bundle?.Unload(unloadAllLoadedObjects: true);
+                }
+                catch (Exception ex)
+                {
+                    SafeAppendDebug($"Mesh bundle unload exception: {ex.Message}");
+                }
+            }
+            _meshAssetBundles.Clear();
+
+            foreach (var watcher in _meshBundleWatchers.Values)
+            {
+                try
+                {
+                    watcher.EnableRaisingEvents = false;
+                    watcher.Changed -= OnMeshBundleFileChanged;
+                    watcher.Created -= OnMeshBundleFileChanged;
+                    watcher.Deleted -= OnMeshBundleFileChanged;
+                    watcher.Renamed -= OnMeshBundleFileRenamed;
+                    watcher.Dispose();
+                }
+                catch
+                {
+                }
+            }
+            _meshBundleWatchers.Clear();
+        }
+
+        private void RevertAllMeshOverrides()
+        {
+            RestoreMeshFilters();
+            RestoreSkinnedRenderers();
+            RestoreMeshColliders();
+            RestoreAllRendererMaterials();
+        }
+
+        private void RestoreMeshFilters()
+        {
+            foreach (var pair in _meshFilterReferences)
+            {
+                if (pair.Value.TryGetTarget(out var filter) && filter != null)
+                {
+                    if (_meshFilterOriginalMeshes.TryGetValue(pair.Key, out var original) && original != null)
+                    {
+                        if (!ReferenceEquals(filter.sharedMesh, original))
+                            filter.sharedMesh = original;
+                    }
+                }
+            }
+            _meshFilterOverrideIds.Clear();
+        }
+
+        private void RestoreSkinnedRenderers()
+        {
+            foreach (var pair in _skinnedRendererReferences)
+            {
+                if (pair.Value.TryGetTarget(out var renderer) && renderer != null)
+                {
+                    if (_skinnedOriginalMeshes.TryGetValue(pair.Key, out var original) && original != null)
+                    {
+                        if (!ReferenceEquals(renderer.sharedMesh, original))
+                            renderer.sharedMesh = original;
+                    }
+                }
+            }
+            _skinnedRendererOverrideIds.Clear();
+        }
+
+        private void RestoreMeshColliders()
+        {
+            foreach (var pair in _meshColliderReferences)
+            {
+                if (pair.Value.TryGetTarget(out var collider) && collider != null)
+                {
+                    if (_meshColliderOriginalMeshes.TryGetValue(pair.Key, out var original) && original != null)
+                    {
+                        if (!ReferenceEquals(collider.sharedMesh, original))
+                            collider.sharedMesh = original;
+                    }
+                }
+            }
+            _meshColliderOverrideIds.Clear();
+        }
+
+        private void RestoreAllRendererMaterials()
+        {
+            foreach (var pair in _rendererReferences)
+            {
+                if (pair.Value.TryGetTarget(out var renderer) && renderer != null)
+                {
+                    if (_rendererOriginalMaterials.TryGetValue(pair.Key, out var originals) && originals != null)
+                    {
+                        renderer.sharedMaterials = originals;
+                    }
+                }
+            }
+
+            _rendererOverrideIds.Clear();
+        }
+
+        private void ApplyMeshOverrides()
+        {
+            if (!_meshOverridesDirty)
+                return;
+
+            _meshOverridesDirty = false;
+
+            ApplyMeshOverridesToMeshFilters();
+            ApplyMeshOverridesToSkinnedRenderers();
+            ApplyMeshOverridesToMeshColliders();
+            CleanupMeshFilterEntries();
+            CleanupSkinnedRendererEntries();
+            CleanupMeshColliderEntries();
+            CleanupRendererEntries();
+        }
+
+        private void ApplyMeshOverridesToMeshFilters()
+        {
+            foreach (var filter in Resources.FindObjectsOfTypeAll<MeshFilter>())
+            {
+                if (filter == null)
+                    continue;
+
+                var id = filter.GetInstanceID();
+                if (!_meshFilterReferences.ContainsKey(id))
+                {
+                    _meshFilterReferences[id] = new WeakReference<MeshFilter>(filter);
+                    _meshFilterOriginalMeshes[id] = filter.sharedMesh;
+                }
+
+                if (!_meshFilterOriginalMeshes.TryGetValue(id, out var originalMesh))
+                {
+                    originalMesh = filter.sharedMesh;
+                    _meshFilterOriginalMeshes[id] = originalMesh;
+                }
+
+                var targetName = originalMesh != null ? originalMesh.name : filter.sharedMesh?.name;
+                if (!string.IsNullOrEmpty(targetName) &&
+                    _meshOverridesByTarget.TryGetValue(targetName, out var overrideData) &&
+                    overrideData != null &&
+                    overrideData.ApplyToMeshFilter)
+                {
+                    var replacement = overrideData.MeshInstance;
+                    if (replacement != null && !ReferenceEquals(filter.sharedMesh, replacement))
+                    {
+                        filter.sharedMesh = replacement;
+                    }
+
+                    _meshFilterOverrideIds.Add(id);
+
+                    var renderer = filter.GetComponent<Renderer>();
+                    if (renderer != null)
+                    {
+                        ApplyRendererMaterialOverrides(renderer, overrideData);
+                    }
+                }
+                else if (_meshFilterOverrideIds.Remove(id))
+                {
+                    if (originalMesh != null && !ReferenceEquals(filter.sharedMesh, originalMesh))
+                    {
+                        filter.sharedMesh = originalMesh;
+                    }
+
+                    var renderer = filter.GetComponent<Renderer>();
+                    if (renderer != null)
+                    {
+                        RestoreRendererMaterials(renderer);
+                    }
+                }
+            }
+        }
+
+        private void ApplyMeshOverridesToSkinnedRenderers()
+        {
+            foreach (var renderer in Resources.FindObjectsOfTypeAll<SkinnedMeshRenderer>())
+            {
+                if (renderer == null)
+                    continue;
+
+                var id = renderer.GetInstanceID();
+                if (!_skinnedRendererReferences.ContainsKey(id))
+                {
+                    _skinnedRendererReferences[id] = new WeakReference<SkinnedMeshRenderer>(renderer);
+                    _skinnedOriginalMeshes[id] = renderer.sharedMesh;
+                }
+
+                if (!_skinnedOriginalMeshes.TryGetValue(id, out var originalMesh))
+                {
+                    originalMesh = renderer.sharedMesh;
+                    _skinnedOriginalMeshes[id] = originalMesh;
+                }
+
+                var targetName = originalMesh != null ? originalMesh.name : renderer.sharedMesh?.name;
+                if (!string.IsNullOrEmpty(targetName) &&
+                    _meshOverridesByTarget.TryGetValue(targetName, out var overrideData) &&
+                    overrideData != null &&
+                    overrideData.ApplyToSkinnedMeshRenderer)
+                {
+                    var replacement = overrideData.MeshInstance;
+                    if (replacement != null && !ReferenceEquals(renderer.sharedMesh, replacement))
+                    {
+                        renderer.sharedMesh = replacement;
+                    }
+
+                    _skinnedRendererOverrideIds.Add(id);
+                    ApplyRendererMaterialOverrides(renderer, overrideData);
+                }
+                else if (_skinnedRendererOverrideIds.Remove(id))
+                {
+                    if (originalMesh != null && !ReferenceEquals(renderer.sharedMesh, originalMesh))
+                    {
+                        renderer.sharedMesh = originalMesh;
+                    }
+                    RestoreRendererMaterials(renderer);
+                }
+            }
+        }
+
+        private void ApplyMeshOverridesToMeshColliders()
+        {
+            foreach (var collider in Resources.FindObjectsOfTypeAll<MeshCollider>())
+            {
+                if (collider == null)
+                    continue;
+
+                var id = collider.GetInstanceID();
+                if (!_meshColliderReferences.ContainsKey(id))
+                {
+                    _meshColliderReferences[id] = new WeakReference<MeshCollider>(collider);
+                    _meshColliderOriginalMeshes[id] = collider.sharedMesh;
+                }
+
+                if (!_meshColliderOriginalMeshes.TryGetValue(id, out var originalMesh))
+                {
+                    originalMesh = collider.sharedMesh;
+                    _meshColliderOriginalMeshes[id] = originalMesh;
+                }
+
+                var targetName = originalMesh != null ? originalMesh.name : collider.sharedMesh?.name;
+                if (!string.IsNullOrEmpty(targetName) &&
+                    _meshOverridesByTarget.TryGetValue(targetName, out var overrideData) &&
+                    overrideData != null &&
+                    overrideData.ApplyToMeshCollider)
+                {
+                    var replacement = overrideData.MeshInstance;
+                    if (replacement != null && !ReferenceEquals(collider.sharedMesh, replacement))
+                    {
+                        collider.sharedMesh = replacement;
+                    }
+
+                    _meshColliderOverrideIds.Add(id);
+                }
+                else if (_meshColliderOverrideIds.Remove(id))
+                {
+                    if (originalMesh != null && !ReferenceEquals(collider.sharedMesh, originalMesh))
+                    {
+                        collider.sharedMesh = originalMesh;
+                    }
+                }
+            }
+        }
+
+        private void CleanupMeshFilterEntries()
+        {
+            var toRemove = new List<int>();
+            foreach (var pair in _meshFilterReferences)
+            {
+                if (!pair.Value.TryGetTarget(out var filter) || filter == null)
+                {
+                    toRemove.Add(pair.Key);
+                }
+            }
+
+            foreach (var id in toRemove)
+            {
+                _meshFilterReferences.Remove(id);
+                _meshFilterOriginalMeshes.Remove(id);
+                _meshFilterOverrideIds.Remove(id);
+            }
+        }
+
+        private void CleanupSkinnedRendererEntries()
+        {
+            var toRemove = new List<int>();
+            foreach (var pair in _skinnedRendererReferences)
+            {
+                if (!pair.Value.TryGetTarget(out var renderer) || renderer == null)
+                {
+                    toRemove.Add(pair.Key);
+                }
+            }
+
+            foreach (var id in toRemove)
+            {
+                _skinnedRendererReferences.Remove(id);
+                _skinnedOriginalMeshes.Remove(id);
+                _skinnedRendererOverrideIds.Remove(id);
+            }
+        }
+
+        private void CleanupMeshColliderEntries()
+        {
+            var toRemove = new List<int>();
+            foreach (var pair in _meshColliderReferences)
+            {
+                if (!pair.Value.TryGetTarget(out var collider) || collider == null)
+                {
+                    toRemove.Add(pair.Key);
+                }
+            }
+
+            foreach (var id in toRemove)
+            {
+                _meshColliderReferences.Remove(id);
+                _meshColliderOriginalMeshes.Remove(id);
+                _meshColliderOverrideIds.Remove(id);
+            }
+        }
+
+        private void CleanupRendererEntries()
+        {
+            var toRemove = new List<int>();
+            foreach (var pair in _rendererReferences)
+            {
+                if (!pair.Value.TryGetTarget(out var renderer) || renderer == null)
+                {
+                    toRemove.Add(pair.Key);
+                }
+            }
+
+            foreach (var id in toRemove)
+            {
+                _rendererReferences.Remove(id);
+                _rendererOriginalMaterials.Remove(id);
+                _rendererOverrideIds.Remove(id);
+            }
+        }
+
+        private void ApplyRendererMaterialOverrides(Renderer renderer, MeshOverrideData data)
+        {
+            if (renderer == null || data == null || data.MaterialOverrides.Count == 0)
+                return;
+
+            var id = renderer.GetInstanceID();
+            if (!_rendererReferences.ContainsKey(id))
+            {
+                _rendererReferences[id] = new WeakReference<Renderer>(renderer);
+            }
+
+            if (!_rendererOriginalMaterials.ContainsKey(id))
+            {
+                var originals = renderer.sharedMaterials ?? Array.Empty<Material>();
+                var copy = new Material[originals.Length];
+                Array.Copy(originals, copy, originals.Length);
+                _rendererOriginalMaterials[id] = copy;
+            }
+
+            var working = renderer.sharedMaterials ?? Array.Empty<Material>();
+            var maxSlot = 0;
+            foreach (var materialOverride in data.MaterialOverrides)
+            {
+                if (materialOverride == null)
+                    continue;
+                if (materialOverride.Slot > maxSlot)
+                    maxSlot = materialOverride.Slot;
+            }
+
+            var requiredLength = Math.Max(working.Length, maxSlot + 1);
+            var updated = new Material[requiredLength];
+            if (working.Length > 0)
+            {
+                Array.Copy(working, updated, working.Length);
+            }
+
+            var changed = false;
+
+            foreach (var materialOverride in data.MaterialOverrides)
+            {
+                if (materialOverride == null || materialOverride.MaterialInstance == null)
+                    continue;
+
+                var slot = materialOverride.Slot;
+                if (slot < 0 || slot >= updated.Length)
+                {
+                    _logger.LogWarning($"[CustomTextureReplacer] Material slot {slot} out of range for renderer '{renderer.name}' (target '{data.TargetName}').");
+                    continue;
+                }
+
+                if (!ReferenceEquals(updated[slot], materialOverride.MaterialInstance))
+                {
+                    updated[slot] = materialOverride.MaterialInstance;
+                    changed = true;
+                }
+            }
+
+            if (changed)
+            {
+                renderer.sharedMaterials = updated;
+                _rendererOverrideIds.Add(id);
+            }
+        }
+
+        private void RestoreRendererMaterials(Renderer renderer)
+        {
+            if (renderer == null)
+                return;
+
+            var id = renderer.GetInstanceID();
+            if (_rendererOverrideIds.Remove(id))
+            {
+                if (_rendererOriginalMaterials.TryGetValue(id, out var originals) && originals != null)
+                {
+                    renderer.sharedMaterials = originals;
+                }
+            }
+        }
+
         private void CollectCandidateTextures(List<Texture2D> destination)
         {
             destination.Clear();
@@ -2007,6 +3593,38 @@ namespace CustomTextureReplacer
             }
         }
 
+        private sealed class MeshOverrideData
+        {
+            public string TargetName;
+            public string MeshAssetName;
+            public string MeshSelectionHint;
+            public bool AutoSelectMesh;
+            public bool AutoSelectMaterials;
+            public string[] MaterialSelectionHints = Array.Empty<string>();
+            public string SourceBundlePath;
+            public Mesh MeshInstance;
+            public bool ApplyToMeshFilter;
+            public bool ApplyToSkinnedMeshRenderer;
+            public bool ApplyToMeshCollider;
+            public List<MaterialOverrideData> MaterialOverrides { get; } = new List<MaterialOverrideData>();
+        }
+
+        private sealed class MaterialOverrideData
+        {
+            public int Slot;
+            public string MaterialAssetName;
+            public string SourceBundlePath;
+            public Material MaterialInstance;
+            public List<MaterialTextureAssignment> TextureAssignments { get; } = new List<MaterialTextureAssignment>();
+        }
+
+        private sealed class MaterialTextureAssignment
+        {
+            public string PropertyName;
+            public string FilePath;
+            public Texture Texture;
+        }
+
         internal void HandleAssetLoad(UnityEngine.Object asset, string context, string detail)
         {
             if (asset == null)
@@ -2030,6 +3648,28 @@ namespace CustomTextureReplacer
                 }
 
                 SafeAppendDebug($"Asset load ({context}) sprite {sprite.name}");
+                RequestReapply(context);
+            }
+            else if (asset is Mesh mesh)
+            {
+                if (_logAssetLoads.Value)
+                {
+                    _logger.LogInfo($"[CustomTextureReplacer] {context}: Mesh '{mesh.name}' {detail}");
+                }
+
+                SafeAppendDebug($"Asset load ({context}) mesh {mesh.name}");
+                _meshOverridesDirty = true;
+                RequestReapply(context);
+            }
+            else if (asset is Material material)
+            {
+                if (_logAssetLoads.Value)
+                {
+                    _logger.LogInfo($"[CustomTextureReplacer] {context}: Material '{material.name}' {detail}");
+                }
+
+                SafeAppendDebug($"Asset load ({context}) material {material.name}");
+                _meshOverridesDirty = true;
                 RequestReapply(context);
             }
         }
@@ -2244,6 +3884,48 @@ namespace CustomTextureReplacer
 
             var single = value.ToString();
             return string.IsNullOrEmpty(single) ? Array.Empty<string>() : new[] { single };
+        }
+
+        private static bool GetBool(Dictionary<string, object> dict, string key, bool defaultValue = false)
+        {
+            if (dict == null || string.IsNullOrEmpty(key))
+                return defaultValue;
+
+            if (!dict.TryGetValue(key, out var value) || value == null)
+                return defaultValue;
+
+            if (value is bool b)
+                return b;
+
+            var text = value.ToString();
+            if (bool.TryParse(text, out var parsed))
+                return parsed;
+
+            if (int.TryParse(text, out var number))
+                return number != 0;
+
+            return defaultValue;
+        }
+
+        private static int GetInt(Dictionary<string, object> dict, string key, int defaultValue = 0)
+        {
+            if (dict == null || string.IsNullOrEmpty(key))
+                return defaultValue;
+
+            if (!dict.TryGetValue(key, out var value) || value == null)
+                return defaultValue;
+
+            if (value is int i)
+                return i;
+
+            if (value is long l)
+                return (int)l;
+
+            if (value is double d)
+                return (int)d;
+
+            var text = value.ToString();
+            return int.TryParse(text, out var parsed) ? parsed : defaultValue;
         }
 
         private bool ResolveCardOverridesPath()
