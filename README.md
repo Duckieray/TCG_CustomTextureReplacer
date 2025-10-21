@@ -1,4 +1,4 @@
-﻿# Custom Texture Replacer
+# Custom Texture Replacer
 
 Runtime mod for **TCG Card Shop Simulator** that lets you replace textures on the fly, customise card metadata, and export the original data set for reference. No restart required — drop files in, press a key, and the game refreshes itself.
 

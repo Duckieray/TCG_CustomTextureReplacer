@@ -1,8 +1,8 @@
 {
   "name": "CustomTextureReplacer",
-  "version_number": "1.6.4",
+  "version_number": "1.6.6",
   "website_url": "",
-  "description": "Swap any texture in TCG Card Shop Simulator at runtime with folder watching, automatic resizing, and texture dump tooling.",
+  "description": "Runtime texture, sprite, and mesh override toolkit for TCG Card Shop Simulator with live watchers, card metadata editing, and debug dumps.",
   "dependencies": [
     "BepInEx-BepInExPack-5.4.2100"
   ]

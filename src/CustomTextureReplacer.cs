@@ -16,7 +16,7 @@ using TMPro;
 using UnityEngine.UI;
 namespace CustomTextureReplacer
 {
-    [BepInPlugin("com.duckieray.cardshop.customtextures", "Custom Texture Replacer", "1.3.0")]
+    [BepInPlugin("com.duckieray.cardshop.customtextures", "Custom Texture Replacer", "1.6.6")]
     public class CustomTextureReplacer : BaseUnityPlugin
     {
         private void Awake()
@@ -88,6 +88,10 @@ namespace CustomTextureReplacer
         private readonly Dictionary<Sprite, Sprite> _spriteOverrides = new Dictionary<Sprite, Sprite>();
         private readonly Dictionary<string, Sprite> _spriteOverridesByName = new Dictionary<string, Sprite>(StringComparer.OrdinalIgnoreCase);
         private readonly Dictionary<Sprite, Texture2D> _spriteOverrideTextures = new Dictionary<Sprite, Texture2D>();
+        private readonly HashSet<int> _imageOverrideInstances = new HashSet<int>();
+        private readonly HashSet<int> _rawImageOverrideInstances = new HashSet<int>();
+        private bool _applyingImageOverride;
+        private bool _applyingRawImageOverride;
         private readonly Dictionary<string, PersistentSpriteOverride> _spritePersistence = new Dictionary<string, PersistentSpriteOverride>(StringComparer.OrdinalIgnoreCase);
         private readonly Dictionary<string, List<PersistentSpriteOverride>> _spritePersistenceByTexture = new Dictionary<string, List<PersistentSpriteOverride>>(StringComparer.OrdinalIgnoreCase);
         private readonly HashSet<Texture2D> _generatedTextures = new HashSet<Texture2D>();
@@ -328,6 +332,8 @@ namespace CustomTextureReplacer
             _spriteOverrides.Clear();
             _spriteOverridesByName.Clear();
             _spriteOverrideTextures.Clear();
+            _imageOverrideInstances.Clear();
+            _rawImageOverrideInstances.Clear();
             _meshTextureFolders.Clear();
             _meshCardOverrides.Clear();
             Instance = null;
@@ -1702,36 +1708,10 @@ namespace CustomTextureReplacer
             {
                 foreach (var obj in Resources.FindObjectsOfTypeAll(UIImageType))
                 {
-                    if (obj == null)
-                        continue;
-
-                    if (obj is Image image)
+                    if (obj is Image image && image != null)
                     {
-                        ApplySpriteOverrideToImage(image);
-                    }
-                    else
-                    {
-                        Sprite currentSprite = null;
-                        try
-                        {
-                            currentSprite = UIImageOverrideSpriteProperty?.GetValue(obj) as Sprite ?? UIImageSpriteProperty.GetValue(obj) as Sprite;
-                        }
-                        catch
-                        {
-                            currentSprite = UIImageSpriteProperty.GetValue(obj) as Sprite;
-                        }
-
-                        var replacement = GetReplacementSprite(currentSprite);
-                        if (replacement != null && !ReferenceEquals(currentSprite, replacement))
-                        {
-                            UIImageSpriteProperty.SetValue(obj, replacement);
-                            UIImageOverrideSpriteProperty?.SetValue(obj, replacement);
-                            if (obj is Graphic graphic)
-                            {
-                                graphic.SetAllDirty();
-                            }
-                            SafeAppendDebug($"UI Image override applied: {currentSprite?.name ?? "<null>"} -> {replacement.name}");
-                        }
+                        var current = image.overrideSprite ?? image.sprite;
+                        ApplySpriteOverrideToImage(image, current);
                     }
                 }
             }
@@ -1740,59 +1720,95 @@ namespace CustomTextureReplacer
             {
                 foreach (var obj in Resources.FindObjectsOfTypeAll(UIRawImageType))
                 {
-                    if (obj == null)
-                        continue;
-
-                    if (obj is RawImage raw)
+                    if (obj is RawImage raw && raw != null)
                     {
-                        ApplyTextureOverrideToRawImage(raw);
-                    }
-                    else
-                    {
-                        var currentTexture = UIRawImageTextureProperty.GetValue(obj) as Texture;
-                        var replacement = GetReplacementTexture(currentTexture);
-                        if (replacement != null && !ReferenceEquals(currentTexture, replacement))
-                        {
-                            UIRawImageTextureProperty.SetValue(obj, replacement);
-                            if (obj is Graphic graphic)
-                            {
-                                graphic.SetAllDirty();
-                            }
-                            SafeAppendDebug($"UI RawImage override applied: {currentTexture?.name ?? "<null>"} -> {replacement.name}");
-                        }
+                        ApplyTextureOverrideToRawImage(raw, raw.texture);
                     }
                 }
             }
         }
 
-        internal void ApplySpriteOverrideToImage(Image image)
+        internal void ApplySpriteOverrideToImage(Image image, Sprite assigned)
         {
             if (image == null)
                 return;
 
-            var probe = image.overrideSprite ?? image.sprite;
-            var replacement = GetReplacementSprite(probe);
-            if (replacement != null && !ReferenceEquals(probe, replacement))
+            if (_applyingImageOverride)
+                return;
+
+            var target = assigned ?? image.sprite;
+            var replacement = GetReplacementSprite(target);
+            var id = image.GetInstanceID();
+
+            if (replacement != null && !ReferenceEquals(target, replacement))
             {
-                image.sprite = replacement;
-                image.overrideSprite = replacement;
-                image.SetAllDirty();
-                SafeAppendDebug($"UI Image override applied (hook): {probe?.name ?? "<null>"} -> {replacement.name}");
+                _imageOverrideInstances.Add(id);
+
+                if (!ReferenceEquals(image.overrideSprite, replacement))
+                {
+                    _applyingImageOverride = true;
+                    image.overrideSprite = replacement;
+                    _applyingImageOverride = false;
+                    image.SetAllDirty();
+                    SafeAppendDebug($"UI Image override applied: {target?.name ?? "<null>"} -> {replacement.name}");
+                }
+            }
+            else
+            {
+                if (_imageOverrideInstances.Remove(id))
+                {
+                    _applyingImageOverride = true;
+                    if (assigned != null && !ReferenceEquals(image.sprite, assigned))
+                        image.overrideSprite = assigned;
+                    else
+                        image.overrideSprite = null;
+                    _applyingImageOverride = false;
+
+                    image.SetAllDirty();
+                    SafeAppendDebug($"UI Image override cleared for '{target?.name ?? "<null>"}'.");
+                }
             }
         }
 
-        internal void ApplyTextureOverrideToRawImage(RawImage rawImage)
+        internal void ApplyTextureOverrideToRawImage(RawImage rawImage, Texture assigned)
         {
             if (rawImage == null)
                 return;
 
-            var current = rawImage.texture;
-            var replacement = GetReplacementTexture(current);
-            if (replacement != null && !ReferenceEquals(current, replacement))
+            if (_applyingRawImageOverride)
+                return;
+
+            var target = assigned ?? rawImage.texture;
+            var replacement = GetReplacementTexture(target);
+            var id = rawImage.GetInstanceID();
+
+            if (replacement != null && !ReferenceEquals(target, replacement))
             {
-                rawImage.texture = replacement;
-                rawImage.SetAllDirty();
-                SafeAppendDebug($"UI RawImage override applied (hook): {current?.name ?? "<null>"} -> {replacement.name}");
+                _rawImageOverrideInstances.Add(id);
+
+                if (!ReferenceEquals(rawImage.texture, replacement))
+                {
+                    _applyingRawImageOverride = true;
+                    rawImage.texture = replacement;
+                    _applyingRawImageOverride = false;
+                    rawImage.SetAllDirty();
+                    SafeAppendDebug($"UI RawImage override applied: {target?.name ?? "<null>"} -> {replacement.name}");
+                }
+            }
+            else
+            {
+                if (_rawImageOverrideInstances.Remove(id))
+                {
+                    if (!ReferenceEquals(rawImage.texture, target))
+                    {
+                        _applyingRawImageOverride = true;
+                        rawImage.texture = target;
+                        _applyingRawImageOverride = false;
+                    }
+
+                    rawImage.SetAllDirty();
+                    SafeAppendDebug($"UI RawImage override cleared for '{target?.name ?? "<null>"}'.");
+                }
             }
         }
 
@@ -3285,6 +3301,11 @@ namespace CustomTextureReplacer
             }
 
             _rendererOverrideIds.Clear();
+        }
+
+        internal void RequestMeshOverrideRescan(float delaySeconds = 0.05f, float retryWindowSeconds = MeshOverrideRetryWindowSeconds)
+        {
+            ScheduleMeshOverrideReapply(delaySeconds, retryWindowSeconds);
         }
 
         private void ScheduleMeshOverrideReapply(float delaySeconds = 0.05f, float retryWindowSeconds = MeshOverrideRetryWindowSeconds)
@@ -5557,16 +5578,16 @@ namespace CustomTextureReplacer
     {
         [HarmonyPostfix]
         [HarmonyPatch("set_sprite")]
-        private static void OnSpriteSet(Image __instance)
+        private static void OnSpriteSet(Image __instance, Sprite value)
         {
-            ReplacerController.Instance?.ApplySpriteOverrideToImage(__instance);
+            ReplacerController.Instance?.ApplySpriteOverrideToImage(__instance, value);
         }
 
         [HarmonyPostfix]
         [HarmonyPatch("set_overrideSprite")]
-        private static void OnOverrideSpriteSet(Image __instance)
+        private static void OnOverrideSpriteSet(Image __instance, Sprite value)
         {
-            ReplacerController.Instance?.ApplySpriteOverrideToImage(__instance);
+            ReplacerController.Instance?.ApplySpriteOverrideToImage(__instance, value);
         }
     }
 
@@ -5575,9 +5596,123 @@ namespace CustomTextureReplacer
     {
         [HarmonyPostfix]
         [HarmonyPatch("set_texture")]
-        private static void OnTextureSet(RawImage __instance)
+        private static void OnTextureSet(RawImage __instance, Texture value)
         {
-            ReplacerController.Instance?.ApplyTextureOverrideToRawImage(__instance);
+            ReplacerController.Instance?.ApplyTextureOverrideToRawImage(__instance, value);
+        }
+    }
+
+    [HarmonyPatch(typeof(MeshFilter))]
+    internal static class MeshFilterPatches
+    {
+        [HarmonyPostfix]
+        [HarmonyPatch("set_sharedMesh")]
+        private static void SharedMeshPostfix(MeshFilter __instance)
+        {
+            ReplacerController.Instance?.RequestMeshOverrideRescan(0f);
+        }
+    }
+
+    [HarmonyPatch(typeof(SkinnedMeshRenderer))]
+    internal static class SkinnedMeshRendererPatches
+    {
+        [HarmonyPostfix]
+        [HarmonyPatch("set_sharedMesh")]
+        private static void SharedMeshPostfix(SkinnedMeshRenderer __instance)
+        {
+            ReplacerController.Instance?.RequestMeshOverrideRescan(0f);
+        }
+    }
+
+    [HarmonyPatch(typeof(MeshCollider))]
+    internal static class MeshColliderPatches
+    {
+        [HarmonyPostfix]
+        [HarmonyPatch("set_sharedMesh")]
+        private static void SharedMeshPostfix(MeshCollider __instance)
+        {
+            ReplacerController.Instance?.RequestMeshOverrideRescan(0f);
+        }
+    }
+
+    [HarmonyPatch(typeof(UnityEngine.Object))]
+    internal static class ObjectInstantiatePatches
+    {
+        [HarmonyPostfix]
+        [HarmonyPatch(nameof(UnityEngine.Object.Instantiate), new[] { typeof(UnityEngine.Object) })]
+        private static void InstantiateObject(UnityEngine.Object original, UnityEngine.Object __result)
+        {
+            HandleInstantiateResult(__result);
+        }
+
+        [HarmonyPostfix]
+        [HarmonyPatch(nameof(UnityEngine.Object.Instantiate), new[] { typeof(UnityEngine.Object), typeof(UnityEngine.Transform) })]
+        private static void InstantiateWithParent(UnityEngine.Object original, UnityEngine.Transform parent, UnityEngine.Object __result)
+        {
+            HandleInstantiateResult(__result);
+        }
+
+        [HarmonyPostfix]
+        [HarmonyPatch(nameof(UnityEngine.Object.Instantiate), new[] { typeof(UnityEngine.Object), typeof(UnityEngine.Transform), typeof(bool) })]
+        private static void InstantiateWithParentSpace(UnityEngine.Object original, UnityEngine.Transform parent, bool instantiateInWorldSpace, UnityEngine.Object __result)
+        {
+            HandleInstantiateResult(__result);
+        }
+
+        [HarmonyPostfix]
+        [HarmonyPatch(nameof(UnityEngine.Object.Instantiate), new[] { typeof(UnityEngine.Object), typeof(Vector3), typeof(Quaternion) })]
+        private static void InstantiateAtPosition(UnityEngine.Object original, Vector3 position, Quaternion rotation, UnityEngine.Object __result)
+        {
+            HandleInstantiateResult(__result);
+        }
+
+        [HarmonyPostfix]
+        [HarmonyPatch(nameof(UnityEngine.Object.Instantiate), new[] { typeof(UnityEngine.Object), typeof(Vector3), typeof(Quaternion), typeof(UnityEngine.Transform) })]
+        private static void InstantiateAtPositionWithParent(UnityEngine.Object original, Vector3 position, Quaternion rotation, UnityEngine.Transform parent, UnityEngine.Object __result)
+        {
+            HandleInstantiateResult(__result);
+        }
+
+        private static void HandleInstantiateResult(UnityEngine.Object instance)
+        {
+            if (instance == null)
+                return;
+
+            if (instance is MeshFilter || instance is SkinnedMeshRenderer || instance is MeshCollider)
+            {
+                ReplacerController.Instance?.RequestMeshOverrideRescan(0f);
+                return;
+            }
+
+            if (instance is Component component)
+            {
+                if (ContainsTargetMeshes(component.gameObject))
+                    ReplacerController.Instance?.RequestMeshOverrideRescan(0f);
+                return;
+            }
+
+            if (instance is GameObject go && ContainsTargetMeshes(go))
+            {
+                ReplacerController.Instance?.RequestMeshOverrideRescan(0f);
+            }
+        }
+
+        private static bool ContainsTargetMeshes(GameObject go)
+        {
+            if (go == null)
+                return false;
+
+            if (go.GetComponent<MeshFilter>() != null ||
+                go.GetComponent<SkinnedMeshRenderer>() != null ||
+                go.GetComponent<MeshCollider>() != null)
+                return true;
+
+            if (go.GetComponentInChildren<MeshFilter>(true) != null ||
+                go.GetComponentInChildren<SkinnedMeshRenderer>(true) != null ||
+                go.GetComponentInChildren<MeshCollider>(true) != null)
+                return true;
+
+            return false;
         }
     }
 
