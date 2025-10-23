@@ -1,6 +1,6 @@
 {
   "name": "CustomTextureReplacer",
-  "version_number": "1.6.6",
+  "version_number": "1.7.0",
   "website_url": "https://github.com/Duckieray/TCG_CustomTextureReplacer",
   "description": "Runtime texture, sprite, and mesh override toolkit for TCG Card Shop Simulator with live watchers, card metadata editing, and debug dumps.",
   "dependencies": [

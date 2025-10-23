@@ -16,7 +16,7 @@ using TMPro;
 using UnityEngine.UI;
 namespace CustomTextureReplacer
 {
-    [BepInPlugin("com.duckieray.cardshop.customtextures", "Custom Texture Replacer", "1.6.6")]
+    [BepInPlugin("com.duckieray.cardshop.customtextures", "Custom Texture Replacer", "1.7.0")]
     public class CustomTextureReplacer : BaseUnityPlugin
     {
         private void Awake()
@@ -67,6 +67,8 @@ namespace CustomTextureReplacer
         private const float MeshOverrideRetryWindowSeconds = 10f;
         private const float MeshOverrideRescanIntervalApplied = 0.25f;
         private const float MeshOverrideRescanIntervalPending = 0.5f;
+        private const float MeshOverrideRescanMinimumDelay = 0.12f;
+        private const int MeshLabelSearchParentDepth = 12;
         private static readonly Type UIImageType = typeof(Image);
         private static readonly PropertyInfo UIImageSpriteProperty = UIImageType.GetProperty("sprite", BindingFlags.Instance | BindingFlags.Public);
         private static readonly PropertyInfo UIImageOverrideSpriteProperty = UIImageType.GetProperty("overrideSprite", BindingFlags.Instance | BindingFlags.Public);
@@ -92,6 +94,30 @@ namespace CustomTextureReplacer
         private readonly HashSet<int> _rawImageOverrideInstances = new HashSet<int>();
         private bool _applyingImageOverride;
         private bool _applyingRawImageOverride;
+        private bool _applyingLabelOverride;
+        private readonly Dictionary<int, string> _meshInstanceTargetByComponent = new Dictionary<int, string>();
+        private readonly Dictionary<int, string> _shelfMeshNameCache = new Dictionary<int, string>();
+        private readonly HashSet<string> _loggedShelfCapacityWarnings = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        private readonly HashSet<string> _loggedMeshLabelCandidates = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        private static readonly FieldInfo ShelfCompartmentItemTypeField = AccessTools.Field(typeof(ShelfCompartment), "m_ItemType");
+        private static readonly FieldInfo ShelfCompartmentItemPosListField = AccessTools.Field(typeof(ShelfCompartment), "m_ItemPosList");
+        internal static readonly Type InventoryBaseType = AccessTools.TypeByName("InventoryBase");
+        internal static readonly Type ItemTypeEnumType = AccessTools.TypeByName("EItemType");
+        internal static readonly MethodInfo InventoryGetItemMeshDataMethod = (InventoryBaseType != null && ItemTypeEnumType != null) ? AccessTools.Method(InventoryBaseType, "GetItemMeshData", new[] { ItemTypeEnumType }) : null;
+        internal static readonly Type ItemMeshDataType = AccessTools.TypeByName("ItemMeshData");
+        internal static readonly FieldInfo ItemMeshDataMeshField = ItemMeshDataType != null ? AccessTools.Field(ItemMeshDataType, "mesh") : null;
+        internal static readonly FieldInfo ShelfCompartmentSizeXField = AccessTools.Field(typeof(ShelfCompartment), "m_SizeX");
+        internal static readonly FieldInfo ShelfCompartmentCurrentItemSizeXField = AccessTools.Field(typeof(ShelfCompartment), "m_CurrentItemSizeX");
+        internal static readonly FieldInfo ShelfCompartmentSizeYField = AccessTools.Field(typeof(ShelfCompartment), "m_SizeY");
+        internal static readonly FieldInfo ShelfCompartmentSizeZField = AccessTools.Field(typeof(ShelfCompartment), "m_SizeZ");
+        internal static readonly FieldInfo ShelfCompartmentCurrentItemSizeYField = AccessTools.Field(typeof(ShelfCompartment), "m_CurrentItemSizeY");
+        internal static readonly FieldInfo ShelfCompartmentCurrentItemSizeZField = AccessTools.Field(typeof(ShelfCompartment), "m_CurrentItemSizeZ");
+        internal static readonly FieldInfo ShelfCompartmentMaxItemXField = AccessTools.Field(typeof(ShelfCompartment), "m_MaxItemX");
+        internal static readonly FieldInfo ShelfCompartmentMaxItemYField = AccessTools.Field(typeof(ShelfCompartment), "m_MaxItemY");
+        internal static readonly FieldInfo ShelfCompartmentMaxItemZField = AccessTools.Field(typeof(ShelfCompartment), "m_MaxItemZ");
+        internal static readonly FieldInfo ShelfCompartmentMaxItemCountField = AccessTools.Field(typeof(ShelfCompartment), "m_MaxItemCount");
+        internal static readonly FieldInfo ShelfCompartmentTransformPosListField = AccessTools.Field(typeof(ShelfCompartment), "m_PosList");
+        internal static readonly FieldInfo ShelfCompartmentStoredItemListGrpField = AccessTools.Field(typeof(ShelfCompartment), "m_StoredItemListGrp");
         private readonly Dictionary<string, PersistentSpriteOverride> _spritePersistence = new Dictionary<string, PersistentSpriteOverride>(StringComparer.OrdinalIgnoreCase);
         private readonly Dictionary<string, List<PersistentSpriteOverride>> _spritePersistenceByTexture = new Dictionary<string, List<PersistentSpriteOverride>>(StringComparer.OrdinalIgnoreCase);
         private readonly HashSet<Texture2D> _generatedTextures = new HashSet<Texture2D>();
@@ -101,7 +127,6 @@ namespace CustomTextureReplacer
         private readonly Dictionary<string, CardTextOverride> _meshCardOverrides = new Dictionary<string, CardTextOverride>(StringComparer.OrdinalIgnoreCase);
         private readonly Dictionary<string, MeshOverrideData> _meshOverridesByTarget = new Dictionary<string, MeshOverrideData>(StringComparer.OrdinalIgnoreCase);
         private readonly HashSet<string> _meshTextureFolders = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        private readonly HashSet<string> _observedStoreLabels = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         private readonly Dictionary<int, WeakReference<MeshFilter>> _meshFilterReferences = new Dictionary<int, WeakReference<MeshFilter>>();
         private readonly Dictionary<int, Mesh> _meshFilterOriginalMeshes = new Dictionary<int, Mesh>();
         private readonly HashSet<int> _meshFilterOverrideIds = new HashSet<int>();
@@ -114,6 +139,10 @@ namespace CustomTextureReplacer
         private readonly Dictionary<int, WeakReference<Renderer>> _rendererReferences = new Dictionary<int, WeakReference<Renderer>>();
         private readonly Dictionary<int, Material[]> _rendererOriginalMaterials = new Dictionary<int, Material[]>();
         private readonly HashSet<int> _rendererOverrideIds = new HashSet<int>();
+        private readonly Dictionary<int, string> _lastAppliedMeshLabels = new Dictionary<int, string>();
+        private readonly Dictionary<int, WeakReference<TMP_Text>> _meshLabelTextRefs = new Dictionary<int, WeakReference<TMP_Text>>();
+        private readonly List<int> _meshLabelCleanupScratch = new List<int>(64);
+        private int _meshLabelCleanupBudget = 64;
         private readonly Dictionary<string, AssetBundle> _meshAssetBundles = new Dictionary<string, AssetBundle>(StringComparer.OrdinalIgnoreCase);
         private readonly Dictionary<string, FileSystemWatcher> _meshBundleWatchers = new Dictionary<string, FileSystemWatcher>(StringComparer.OrdinalIgnoreCase);
         private readonly HashSet<string> _pendingSpriteAtlasReapply = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -128,6 +157,9 @@ namespace CustomTextureReplacer
         private ManualLogSource _logger;
         private ConfigEntry<bool> _logNewTextureNames;
         private ConfigEntry<bool> _logAssetLoads;
+        private ConfigEntry<bool> _enableDebugLog;
+        private ConfigEntry<bool> _enableAutoDumps;
+        private ConfigEntry<bool> _suppressRectTransformWarning;
 
         private readonly List<string> _textureFolders = new List<string>();
         private string _dumpFile = string.Empty;
@@ -139,8 +171,6 @@ namespace CustomTextureReplacer
         private string _exportFolder = string.Empty;
         private string _meshDumpFile = string.Empty;
         private string _meshDumpTriggerFile = string.Empty;
-        private string _storeLabelsDumpFile = string.Empty;
-        private string _storeLabelsDumpTriggerFile = string.Empty;
 
         private readonly List<FileSystemWatcher> _watchers = new List<FileSystemWatcher>();
         private ConfigEntry<FolderPriorityMode> _folderPriorityMode;
@@ -181,6 +211,9 @@ namespace CustomTextureReplacer
 
             _logNewTextureNames = config.Bind("Debug", "LogNewTextureNames", true, "Log the names of textures discovered during runtime scans.");
             _logAssetLoads = config.Bind("Debug", "LogAssetLoads", true, "Log texture and sprite loads coming from Resources/AssetBundle APIs.");
+            _enableDebugLog = config.Bind("Debug", "EnableDebugLogFile", false, "Write CustomTextureReplacer.debug.log for troubleshooting. Disable to avoid extra disk writes.");
+            _enableAutoDumps = config.Bind("Debug", "EnableAutomaticDumps", false, "Automatically dump texture/sprite/mesh lists after loading. Disable to avoid large writes at start-up.");
+            _suppressRectTransformWarning = config.Bind("Debug", "SuppressRectTransformParentWarning", true, "Suppress the noisy 'Parent of RectTransform is being set with parent property' warnings Unity emits.");
             _folderPriorityMode = config.Bind("General", "FolderPriorityMode", FolderPriorityMode.LastModified, "Determines which texture file wins when duplicates exist across folders. Options: LastModified, PreferredFolder, FolderOrder.");
             _preferredFolderHint = config.Bind("General", "PreferredFolderHint", string.Empty, "When FolderPriorityMode=PreferredFolder, provide folder names or path fragments (separated by ';' ',' or '|') to prioritise.");
 
@@ -214,8 +247,6 @@ namespace CustomTextureReplacer
             Directory.CreateDirectory(_exportFolder);
             _meshDumpFile = Path.Combine(Paths.PluginPath, "MeshesList.txt");
             _meshDumpTriggerFile = Path.Combine(Paths.PluginPath, "MeshesList.dump.now");
-            _storeLabelsDumpFile = Path.Combine(Paths.PluginPath, "StoreItemsList.txt");
-            _storeLabelsDumpTriggerFile = Path.Combine(Paths.PluginPath, "StoreItems.dump.now");
 
             SafeAppendDebug("Controller initialised.");
 
@@ -228,7 +259,8 @@ namespace CustomTextureReplacer
             ReloadCustomTextures();
             ReapplyExistingSpriteAtlases("Initialise");
             ScheduleMeshOverrideReapply(0f);
-            StartCoroutine(InitialDump());
+            if (_enableAutoDumps != null && _enableAutoDumps.Value)
+                StartCoroutine(InitialDump());
 
             _nextScanTime = Time.realtimeSinceStartup + ScanIntervalSeconds;
         }
@@ -377,13 +409,6 @@ namespace CustomTextureReplacer
                 _logger.LogInfo($"[CustomTextureReplacer] Manual mesh dump triggered via '{Path.GetFileName(_meshDumpTriggerFile)}'.");
                 SafeAppendDebug("Mesh dump trigger consumed.");
                 DumpAllMeshes();
-            }
-
-            if (CheckAndConsumeFileTrigger(_storeLabelsDumpTriggerFile))
-            {
-                _logger.LogInfo($"[CustomTextureReplacer] Store label dump triggered via '{Path.GetFileName(_storeLabelsDumpTriggerFile)}'.");
-                SafeAppendDebug("Store label dump trigger consumed.");
-                DumpStoreLabels();
             }
 
             if (_reloadRequested)
@@ -863,6 +888,10 @@ namespace CustomTextureReplacer
         private IEnumerator InitialDump()
         {
             yield return new WaitForSecondsRealtime(1f);
+
+            if (_enableAutoDumps == null || !_enableAutoDumps.Value)
+                yield break;
+
             _logger.LogInfo("[CustomTextureReplacer] Performing initial texture dump.");
             SafeAppendDebug("Initial dump coroutine running.");
             DumpAllTextures();
@@ -879,7 +908,7 @@ namespace CustomTextureReplacer
             SafeAppendDebug($"ApplyReplacementsNextFrame for {sceneName}");
             ReplaceAllTextures();
 
-            if (!_hasDumpedAfterSceneLoad)
+            if (!_hasDumpedAfterSceneLoad && _enableAutoDumps != null && _enableAutoDumps.Value)
             {
                 _hasDumpedAfterSceneLoad = true;
                 SafeAppendDebug("Dumping after scene load.");
@@ -903,7 +932,6 @@ namespace CustomTextureReplacer
             _customTextureIds.Clear();
             _spritePersistence.Clear();
             _spritePersistenceByTexture.Clear();
-            _observedStoreLabels.Clear();
 
             bool foldersChanged = DiscoverTextureFolders(logDetails: false);
             if (foldersChanged || _watchers.Count == 0)
@@ -1993,29 +2021,6 @@ namespace CustomTextureReplacer
             }
         }
 
-        private void DumpStoreLabels()
-        {
-            if (string.IsNullOrEmpty(_storeLabelsDumpFile))
-                return;
-
-            try
-            {
-                var ordered = _observedStoreLabels
-                    .Where(label => !string.IsNullOrEmpty(label))
-                    .OrderBy(label => label, StringComparer.OrdinalIgnoreCase)
-                    .ToList();
-
-                File.WriteAllLines(_storeLabelsDumpFile, ordered);
-                _logger.LogInfo($"[CustomTextureReplacer] Dumped store label list to '{_storeLabelsDumpFile}' ({ordered.Count} entries).");
-                SafeAppendDebug($"DumpStoreLabels wrote {ordered.Count} entries");
-            }
-            catch (Exception ex)
-            {
-                _logger.LogWarning($"[CustomTextureReplacer] Unable to dump store labels: {ex.Message}");
-                SafeAppendDebug($"DumpStoreLabels exception: {ex.Message}");
-            }
-        }
-
         private bool ResolveMeshOverridesPath()
         {
             var previous = _meshOverridesPath ?? string.Empty;
@@ -2211,6 +2216,18 @@ namespace CustomTextureReplacer
                         ApplyToSkinnedMeshRenderer = GetBool(entryDict, "applyToSkinnedMeshRenderers", true),
                         ApplyToMeshCollider = GetBool(entryDict, "applyToMeshColliders", false)
                     };
+
+                    var shelfCount = GetInt(entryDict, "shelfCount", -1);
+                    var instanceCount = GetInt(entryDict, "instanceCount", -1);
+                    if (shelfCount < 0 && instanceCount >= 0)
+                        shelfCount = instanceCount;
+                    if (shelfCount >= 0)
+                    {
+                        data.DesiredShelfCapacity = shelfCount;
+                        data.ShelfAllocationsDirty = true;
+                    }
+                    if (instanceCount >= 0)
+                        data.DesiredInstanceCount = instanceCount;
 
                     if (data.AutoSelectMesh && bundle == null)
                     {
@@ -2911,7 +2928,8 @@ namespace CustomTextureReplacer
                 Stat4 = stat4,
                 Rarity = rarity,
                 Fame = fame,
-                Aliases = aliases.ToArray()
+                Aliases = aliases.ToArray(),
+                IsMeshOverride = true
             };
 
             return entry;
@@ -3169,6 +3187,14 @@ namespace CustomTextureReplacer
         {
             foreach (var entry in _meshOverridesByTarget.Values)
             {
+                if (entry != null)
+                {
+                    RestoreHiddenInstances(entry);
+                    entry.InstanceIds.Clear();
+                    entry.InstanceReferences.Clear();
+                    entry.HiddenInstanceIds.Clear();
+                }
+
                 if (entry?.MeshInstance != null)
                 {
                     Destroy(entry.MeshInstance);
@@ -3197,6 +3223,9 @@ namespace CustomTextureReplacer
                 }
             }
             _meshOverridesByTarget.Clear();
+            _meshInstanceTargetByComponent.Clear();
+            _shelfMeshNameCache.Clear();
+            _loggedShelfCapacityWarnings.Clear();
             _meshOverrideRetryDeadline = 0f;
             _meshOverrideRetryLogged = false;
 
@@ -3310,9 +3339,24 @@ namespace CustomTextureReplacer
 
         private void ScheduleMeshOverrideReapply(float delaySeconds = 0.05f, float retryWindowSeconds = MeshOverrideRetryWindowSeconds)
         {
+            if (_meshOverridesByTarget.Count == 0)
+                return;
+
             var now = Time.realtimeSinceStartup;
-            _meshOverridesDirty = true;
-            _nextMeshOverrideScanTime = now + Mathf.Max(0f, delaySeconds);
+            var minDelay = Mathf.Max(delaySeconds, MeshOverrideRescanMinimumDelay);
+            var requestedTime = now + minDelay;
+
+            if (_meshOverridesDirty)
+            {
+                // If an earlier scan is already scheduled, keep it; otherwise adopt the new time.
+                if (requestedTime > _nextMeshOverrideScanTime)
+                    _nextMeshOverrideScanTime = requestedTime;
+            }
+            else
+            {
+                _meshOverridesDirty = true;
+                _nextMeshOverrideScanTime = requestedTime;
+            }
 
             if (retryWindowSeconds > 0f)
             {
@@ -3343,6 +3387,7 @@ namespace CustomTextureReplacer
             CleanupSkinnedRendererEntries();
             CleanupMeshColliderEntries();
             CleanupRendererEntries();
+            EnforceMeshOverrideInstanceCounts();
 
             var now = Time.realtimeSinceStartup;
             var hasOverrides = _meshOverridesByTarget.Count > 0;
@@ -3396,6 +3441,9 @@ namespace CustomTextureReplacer
 
                     if (overrideData.ApplyToMeshFilter)
                     {
+                        RegisterMeshInstance(overrideData, filter.gameObject);
+                        _meshInstanceTargetByComponent[id] = overrideData.TargetName;
+
                         var replacement = overrideData.MeshInstance;
                         if (replacement != null && !ReferenceEquals(filter.sharedMesh, replacement))
                         {
@@ -3416,6 +3464,13 @@ namespace CustomTextureReplacer
                     }
                     else if (_meshFilterOverrideIds.Remove(id))
                     {
+                        if (_meshInstanceTargetByComponent.TryGetValue(id, out var previousTarget) &&
+                            _meshOverridesByTarget.TryGetValue(previousTarget, out var previousData))
+                        {
+                            UnregisterMeshInstance(previousData, filter.gameObject);
+                        }
+                        _meshInstanceTargetByComponent.Remove(id);
+
                         if (originalMesh != null && !ReferenceEquals(filter.sharedMesh, originalMesh))
                         {
                             filter.sharedMesh = originalMesh;
@@ -3431,6 +3486,13 @@ namespace CustomTextureReplacer
                 }
                 else if (_meshFilterOverrideIds.Remove(id))
                 {
+                    if (_meshInstanceTargetByComponent.TryGetValue(id, out var previousTarget) &&
+                        _meshOverridesByTarget.TryGetValue(previousTarget, out var previousData))
+                    {
+                        UnregisterMeshInstance(previousData, filter.gameObject);
+                    }
+                    _meshInstanceTargetByComponent.Remove(id);
+
                     if (originalMesh != null && !ReferenceEquals(filter.sharedMesh, originalMesh))
                     {
                         filter.sharedMesh = originalMesh;
@@ -3478,6 +3540,9 @@ namespace CustomTextureReplacer
 
                     if (overrideData.ApplyToSkinnedMeshRenderer)
                     {
+                        RegisterMeshInstance(overrideData, renderer.gameObject);
+                        _meshInstanceTargetByComponent[id] = overrideData.TargetName;
+
                         var replacement = overrideData.MeshInstance;
                         if (replacement != null && !ReferenceEquals(renderer.sharedMesh, replacement))
                         {
@@ -3496,6 +3561,13 @@ namespace CustomTextureReplacer
                     }
                     else if (_skinnedRendererOverrideIds.Remove(id))
                     {
+                        if (_meshInstanceTargetByComponent.TryGetValue(id, out var previousTarget) &&
+                            _meshOverridesByTarget.TryGetValue(previousTarget, out var previousData))
+                        {
+                            UnregisterMeshInstance(previousData, renderer.gameObject);
+                        }
+                        _meshInstanceTargetByComponent.Remove(id);
+
                         if (originalMesh != null && !ReferenceEquals(renderer.sharedMesh, originalMesh))
                         {
                             renderer.sharedMesh = originalMesh;
@@ -3509,6 +3581,13 @@ namespace CustomTextureReplacer
                 }
                 else if (_skinnedRendererOverrideIds.Remove(id))
                 {
+                    if (_meshInstanceTargetByComponent.TryGetValue(id, out var previousTarget) &&
+                        _meshOverridesByTarget.TryGetValue(previousTarget, out var previousData))
+                    {
+                        UnregisterMeshInstance(previousData, renderer.gameObject);
+                    }
+                    _meshInstanceTargetByComponent.Remove(id);
+
                     if (originalMesh != null && !ReferenceEquals(renderer.sharedMesh, originalMesh))
                     {
                         renderer.sharedMesh = originalMesh;
@@ -3554,6 +3633,9 @@ namespace CustomTextureReplacer
 
                     if (overrideData.ApplyToMeshCollider)
                     {
+                        RegisterMeshInstance(overrideData, collider.gameObject);
+                        _meshInstanceTargetByComponent[id] = overrideData.TargetName;
+
                         var replacement = overrideData.MeshInstance;
                         if (replacement != null && !ReferenceEquals(collider.sharedMesh, replacement))
                         {
@@ -3566,6 +3648,13 @@ namespace CustomTextureReplacer
                     }
                     else if (_meshColliderOverrideIds.Remove(id))
                     {
+                        if (_meshInstanceTargetByComponent.TryGetValue(id, out var previousTarget) &&
+                            _meshOverridesByTarget.TryGetValue(previousTarget, out var previousData))
+                        {
+                            UnregisterMeshInstance(previousData, collider.gameObject);
+                        }
+                        _meshInstanceTargetByComponent.Remove(id);
+
                         if (originalMesh != null && !ReferenceEquals(collider.sharedMesh, originalMesh))
                         {
                             collider.sharedMesh = originalMesh;
@@ -3575,6 +3664,13 @@ namespace CustomTextureReplacer
                 }
                 else if (_meshColliderOverrideIds.Remove(id))
                 {
+                    if (_meshInstanceTargetByComponent.TryGetValue(id, out var previousTarget) &&
+                        _meshOverridesByTarget.TryGetValue(previousTarget, out var previousData))
+                    {
+                        UnregisterMeshInstance(previousData, collider.gameObject);
+                    }
+                    _meshInstanceTargetByComponent.Remove(id);
+
                     if (originalMesh != null && !ReferenceEquals(collider.sharedMesh, originalMesh))
                     {
                         collider.sharedMesh = originalMesh;
@@ -3584,6 +3680,625 @@ namespace CustomTextureReplacer
             }
 
             return applied;
+        }
+
+        private void RegisterMeshInstance(MeshOverrideData data, GameObject instance)
+        {
+            if (data == null || instance == null)
+                return;
+
+            var id = instance.GetInstanceID();
+            if (!data.InstanceIds.Add(id))
+                return;
+
+            data.InstanceReferences.Add(new WeakReference<GameObject>(instance));
+            data.HiddenInstanceIds.Remove(id);
+            ApplyMeshInstanceNameOverrides(data, instance);
+        }
+
+        private void UnregisterMeshInstance(MeshOverrideData data, GameObject instance)
+        {
+            if (data == null || instance == null)
+                return;
+
+            var id = instance.GetInstanceID();
+            data.InstanceIds.Remove(id);
+            if (data.HiddenInstanceIds.Remove(id) && !instance.activeSelf)
+            {
+                instance.SetActive(true);
+            }
+
+            for (int i = data.InstanceReferences.Count - 1; i >= 0; i--)
+            {
+                if (!data.InstanceReferences[i].TryGetTarget(out var existing) || existing == null || existing.GetInstanceID() == id)
+                {
+                    data.InstanceReferences.RemoveAt(i);
+                }
+            }
+        }
+
+        private void ApplyMeshInstanceNameOverrides(MeshOverrideData data, GameObject instance)
+        {
+            if (data == null || instance == null)
+                return;
+
+            var cardOverride = data.CardOverride;
+            if (cardOverride == null || !HasAnyCardOverrides())
+                return;
+
+            try
+            {
+                foreach (var text in EnumerateNearbyTextComponents(instance))
+                {
+                    if (text == null)
+                        continue;
+
+                    string originalLabel;
+                    try
+                    {
+                        originalLabel = text.text;
+                    }
+                    catch
+                    {
+                        continue;
+                    }
+
+                    if (string.IsNullOrEmpty(originalLabel))
+                        continue;
+
+                    if (!LabelMatchesOverride(originalLabel, data))
+                    {
+                        LogMeshLabelCandidate(data, text, originalLabel, matched: false);
+                        continue;
+                    }
+
+                    ReplaceNameLabel(text, cardOverride, originalLabel);
+                    LogMeshLabelCandidate(data, text, originalLabel, matched: true);
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug($"[CustomTextureReplacer] ApplyMeshInstanceNameOverrides failed: {ex.Message}");
+                SafeAppendDebug($"ApplyMeshInstanceNameOverrides exception: {ex.Message}");
+            }
+        }
+
+        private void ReapplyMeshInstanceNameOverrides()
+        {
+            if (!HasAnyCardOverrides())
+                return;
+
+            try
+            {
+                foreach (var data in _meshOverridesByTarget.Values)
+                {
+                    if (data == null || data.CardOverride == null)
+                        continue;
+
+                    for (int i = data.InstanceReferences.Count - 1; i >= 0; i--)
+                    {
+                        if (!data.InstanceReferences[i].TryGetTarget(out var instance) || instance == null)
+                        {
+                            data.InstanceReferences.RemoveAt(i);
+                            continue;
+                        }
+
+                        ApplyMeshInstanceNameOverrides(data, instance);
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug($"[CustomTextureReplacer] ReapplyMeshInstanceNameOverrides failed: {ex.Message}");
+                SafeAppendDebug($"ReapplyMeshInstanceNameOverrides exception: {ex.Message}");
+            }
+        }
+
+        private IEnumerable<TMP_Text> EnumerateNearbyTextComponents(GameObject instance)
+        {
+            if (instance == null)
+                yield break;
+
+            var visited = new HashSet<int>();
+            var current = instance.transform;
+            var depth = 0;
+
+            while (current != null && depth < MeshLabelSearchParentDepth)
+            {
+                TMP_Text[] buffer;
+                try
+                {
+                    buffer = current.GetComponentsInChildren<TMP_Text>(true);
+                }
+                catch
+                {
+                    buffer = Array.Empty<TMP_Text>();
+                }
+
+                foreach (var text in buffer)
+                {
+                    if (text == null)
+                        continue;
+
+                    var id = text.GetInstanceID();
+                    if (visited.Add(id))
+                        yield return text;
+                }
+
+                current = current.parent;
+                depth++;
+            }
+        }
+
+        private static bool LabelMatchesOverride(string label, MeshOverrideData data)
+        {
+            if (string.IsNullOrEmpty(label) || data?.CardOverride == null)
+                return false;
+
+            if (MatchesCandidate(label, data))
+                return true;
+
+            var prefix = GetNamePrefix(label);
+            if (!string.IsNullOrEmpty(prefix) && MatchesCandidate(prefix, data))
+                return true;
+
+            return false;
+        }
+
+        private static bool MatchesCandidate(string candidate, MeshOverrideData data)
+        {
+            if (data?.CardOverride == null)
+                return false;
+
+            var trimmed = candidate?.Trim();
+            if (string.IsNullOrEmpty(trimmed))
+                return false;
+
+            var entry = data.CardOverride;
+
+            if (!string.IsNullOrEmpty(entry.DisplayName) &&
+                string.Equals(trimmed, entry.DisplayName, StringComparison.OrdinalIgnoreCase))
+                return true;
+
+            if (!string.IsNullOrEmpty(entry.Id) &&
+                string.Equals(trimmed, entry.Id, StringComparison.OrdinalIgnoreCase))
+                return true;
+
+            if (!string.IsNullOrEmpty(data.TargetName) &&
+                string.Equals(trimmed, data.TargetName, StringComparison.OrdinalIgnoreCase))
+                return true;
+
+            if (entry.Aliases != null)
+            {
+                foreach (var alias in entry.Aliases)
+                {
+                    if (string.IsNullOrEmpty(alias))
+                        continue;
+
+                    if (string.Equals(trimmed, alias.Trim(), StringComparison.OrdinalIgnoreCase))
+                        return true;
+                }
+            }
+
+            return false;
+        }
+
+        private void LogMeshLabelCandidate(MeshOverrideData data, TMP_Text text, string label, bool matched)
+        {
+            if (data == null || text == null)
+                return;
+
+            var path = GetTransformPath(text.transform, 32);
+            var key = $"{data.TargetName}|{label}|{path}|{matched}";
+            if (!_loggedMeshLabelCandidates.Add(key))
+                return;
+
+            var status = matched ? "match" : "no-match";
+            SafeAppendDebug($"Mesh label {status} for '{data.TargetName}': '{label}' @ {path}");
+        }
+
+        private static string GetTransformPath(Transform transform, int maxDepth)
+        {
+            if (transform == null)
+                return "<null>";
+
+            var names = new List<string>();
+            var current = transform;
+            var depth = 0;
+            while (current != null && depth < maxDepth)
+            {
+                names.Add(current.name);
+                current = current.parent;
+                depth++;
+            }
+
+            names.Reverse();
+            return string.Join("/", names);
+        }
+
+        private void EnforceMeshOverrideInstanceCounts()
+        {
+            foreach (var data in _meshOverridesByTarget.Values)
+            {
+                if (data == null)
+                    continue;
+
+                if (data.DesiredInstanceCount < 0)
+                {
+                    RestoreHiddenInstances(data);
+                    continue;
+                }
+
+                ApplyMeshInstanceLimit(data);
+            }
+        }
+
+        private void ApplyMeshInstanceLimit(MeshOverrideData data)
+        {
+            if (data == null)
+                return;
+
+            var desired = data.DesiredInstanceCount;
+            if (desired < 0)
+                return;
+
+            var alive = new List<GameObject>();
+            for (int i = data.InstanceReferences.Count - 1; i >= 0; i--)
+            {
+                if (data.InstanceReferences[i].TryGetTarget(out var go) && go != null)
+                {
+                    data.InstanceIds.Add(go.GetInstanceID());
+                    alive.Add(go);
+                }
+                else
+                {
+                    data.InstanceReferences.RemoveAt(i);
+                }
+            }
+
+            if (alive.Count == 0)
+            {
+                data.HiddenInstanceIds.Clear();
+                return;
+            }
+
+            var groups = new Dictionary<int, List<GameObject>>();
+            foreach (var go in alive)
+            {
+                var parent = go.transform.parent != null ? go.transform.parent.gameObject : go;
+                var parentId = parent.GetInstanceID();
+                if (!groups.TryGetValue(parentId, out var list))
+                {
+                    list = new List<GameObject>();
+                    groups[parentId] = list;
+                }
+                list.Add(go);
+            }
+
+            foreach (var pair in groups)
+            {
+                var list = pair.Value;
+                list.Sort((a, b) => a.transform.GetSiblingIndex().CompareTo(b.transform.GetSiblingIndex()));
+
+                for (int i = 0; i < list.Count; i++)
+                {
+                    var go = list[i];
+                    var id = go.GetInstanceID();
+                    if (i < desired)
+                    {
+                        if (!go.activeSelf)
+                        {
+                            go.SetActive(true);
+                        }
+                        data.HiddenInstanceIds.Remove(id);
+                    }
+                    else
+                    {
+                        if (go.activeSelf)
+                        {
+                            go.SetActive(false);
+                        }
+                        data.HiddenInstanceIds.Add(id);
+                    }
+                }
+
+                if (desired > list.Count)
+                {
+                    SafeAppendDebug($"Mesh override '{data.TargetName}' requested {desired} instances but only {list.Count} exist under parent '{pair.Key}'.");
+                }
+            }
+        }
+        private void RestoreHiddenInstances(MeshOverrideData data)
+        {
+            if (data == null || data.HiddenInstanceIds.Count == 0)
+                return;
+
+            for (int i = data.InstanceReferences.Count - 1; i >= 0; i--)
+            {
+                if (!data.InstanceReferences[i].TryGetTarget(out var go) || go == null)
+                {
+                    data.InstanceReferences.RemoveAt(i);
+                    continue;
+                }
+
+                var id = go.GetInstanceID();
+                if (data.HiddenInstanceIds.Remove(id) && !go.activeSelf)
+                {
+                    go.SetActive(true);
+                }
+            }
+
+            data.HiddenInstanceIds.Clear();
+        }
+        internal void AdjustShelfSpawn(ShelfCompartment compartment, ref int amount)
+        {
+            if (compartment == null || amount <= 0 || _meshOverridesByTarget.Count == 0)
+                return;
+
+            if (!TryGetShelfOverride(compartment, out var data, out var meshName))
+                return;
+
+            var desiredPerSlot = data.DesiredShelfCapacity;
+            if (desiredPerSlot < 0)
+                return;
+
+            var anchors = GetShelfAnchorCount(compartment);
+            var slotKey = GetShelfSlotKey(compartment);
+            var slotState = EnsureShelfSlotState(data, slotKey, anchors);
+            if (slotState == null)
+                return;
+
+            RefreshShelfSlotAllocations(data);
+
+            var slotLimit = slotState.DesiredCapacity >= 0 ? slotState.DesiredCapacity : desiredPerSlot;
+            if (slotLimit < 0)
+                slotLimit = desiredPerSlot;
+
+            var targetCapacity = Math.Max(0, slotLimit);
+            var currentCount = GetShelfItemCount(compartment);
+            slotState.LastItemCount = currentCount;
+
+            var needed = targetCapacity - currentCount;
+            if (needed < 0)
+                needed = 0;
+
+            var originalAmount = amount;
+
+            amount = needed;
+
+            SafeAppendDebug($"Shelf slot {slotKey} for '{meshName}': default={slotState.DefaultCapacity}, anchorsNow={anchors}, desiredPerSlot={targetCapacity}, currentCount={currentCount}, needed={needed}, requestedAmount={originalAmount}, appliedAmount={amount}");
+
+            if (anchors > 0 && targetCapacity > anchors)
+            {
+                var warningKey = string.Concat(meshName, ":", anchors.ToString());
+                if (_loggedShelfCapacityWarnings.Add(warningKey))
+                {
+                    SafeAppendDebug(string.Format("Shelf slot for '{0}' currently exposes {1} anchors; requested {2}.", meshName, anchors, targetCapacity));
+                }
+            }
+        }
+
+        private string GetShelfMeshName(ShelfCompartment compartment)
+        {
+            if (compartment == null)
+                return string.Empty;
+
+            var id = compartment.GetInstanceID();
+            if (_shelfMeshNameCache.TryGetValue(id, out var cached) && !string.IsNullOrEmpty(cached))
+                return cached;
+
+            if (ShelfCompartmentItemTypeField == null || InventoryGetItemMeshDataMethod == null || ItemMeshDataMeshField == null)
+                return string.Empty;
+
+            object itemType;
+            try
+            {
+                itemType = ShelfCompartmentItemTypeField.GetValue(compartment);
+            }
+            catch
+            {
+                return string.Empty;
+            }
+
+            if (itemType == null)
+                return string.Empty;
+
+            object meshData = null;
+            try
+            {
+                meshData = InventoryGetItemMeshDataMethod.Invoke(null, new[] { itemType });
+            }
+            catch
+            {
+                return string.Empty;
+            }
+
+            if (meshData == null)
+                return string.Empty;
+
+            Mesh mesh = null;
+            try
+            {
+                mesh = ItemMeshDataMeshField.GetValue(meshData) as Mesh;
+            }
+            catch
+            {
+                return string.Empty;
+            }
+
+            var name = mesh?.name ?? string.Empty;
+            if (!string.IsNullOrEmpty(name))
+                _shelfMeshNameCache[id] = name;
+
+            return name;
+        }
+
+        internal int GetShelfSlotKey(ShelfCompartment compartment)
+        {
+            if (compartment == null)
+                return 0;
+
+            if (ShelfCompartmentStoredItemListGrpField != null &&
+                ShelfCompartmentStoredItemListGrpField.GetValue(compartment) is Transform group &&
+                group != null)
+            {
+                return group.GetInstanceID();
+            }
+
+            return compartment.GetInstanceID();
+        }
+
+        internal int GetShelfAnchorCount(ShelfCompartment compartment)
+        {
+            if (compartment == null)
+                return 0;
+
+            var positions = ShelfCompartmentItemPosListField?.GetValue(compartment) as System.Collections.ICollection;
+            return positions?.Count ?? 0;
+        }
+
+        internal int GetShelfItemCount(ShelfCompartment compartment)
+        {
+            if (compartment == null)
+                return 0;
+
+            if (ShelfCompartmentStoredItemListGrpField != null &&
+                ShelfCompartmentStoredItemListGrpField.GetValue(compartment) is Transform group &&
+                group != null)
+            {
+                return group.childCount;
+            }
+
+            return 0;
+        }
+
+        internal ShelfSlotState EnsureShelfSlotState(MeshOverrideData data, int slotKey, int anchors)
+        {
+            if (data == null)
+                return null;
+
+            var slotCreated = false;
+            if (!data.ShelfSlots.TryGetValue(slotKey, out var slotState))
+            {
+                slotState = new ShelfSlotState();
+                data.ShelfSlots[slotKey] = slotState;
+                slotCreated = true;
+            }
+
+            if (anchors > 0 && slotState.DefaultCapacity != anchors)
+            {
+                slotState.DefaultCapacity = anchors;
+                data.ShelfAllocationsDirty = true;
+            }
+
+            if (slotState.LastAnchorCount != anchors)
+            {
+                slotState.LastAnchorCount = anchors;
+                if (slotState.DefaultCapacity <= 0)
+                    data.ShelfAllocationsDirty = true;
+            }
+
+            if (slotCreated)
+                data.ShelfAllocationsDirty = true;
+
+            if (slotState.DesiredCapacity != data.DesiredShelfCapacity)
+                data.ShelfAllocationsDirty = true;
+
+            return slotState;
+        }
+
+        internal void ApplyShelfLayoutScaling(ShelfCompartment compartment, MeshOverrideData data, int desiredCapacity)
+        {
+            if (compartment == null || data == null || desiredCapacity <= 0)
+                return;
+
+            if (ShelfCompartmentSizeXField == null || ShelfCompartmentCurrentItemSizeXField == null)
+                return;
+
+            var sizeXObj = ShelfCompartmentSizeXField.GetValue(compartment);
+            if (!(sizeXObj is int sizeX) || sizeX <= 0)
+                return;
+
+            var itemSizeXObj = ShelfCompartmentCurrentItemSizeXField.GetValue(compartment);
+            var currentItemSizeX = itemSizeXObj is float sx && sx > 0f ? sx : sizeX;
+
+            var sizeY = ShelfCompartmentSizeYField != null ? Convert.ToInt32(ShelfCompartmentSizeYField.GetValue(compartment)) : 1;
+            var sizeZ = ShelfCompartmentSizeZField != null ? Convert.ToInt32(ShelfCompartmentSizeZField.GetValue(compartment)) : 1;
+            if (sizeY <= 0) sizeY = 1;
+            if (sizeZ <= 0) sizeZ = 1;
+
+            var itemSizeY = ShelfCompartmentCurrentItemSizeYField != null ? Convert.ToSingle(ShelfCompartmentCurrentItemSizeYField.GetValue(compartment)) : 1f;
+            var itemSizeZ = ShelfCompartmentCurrentItemSizeZField != null ? Convert.ToSingle(ShelfCompartmentCurrentItemSizeZField.GetValue(compartment)) : 1f;
+            if (itemSizeY <= 0f) itemSizeY = 1f;
+            if (itemSizeZ <= 0f) itemSizeZ = 1f;
+
+            var defaultMaxX = Mathf.Max(1, Mathf.RoundToInt(sizeX / Mathf.Max(currentItemSizeX, 0.0001f)));
+            var maxY = Mathf.Max(1, Mathf.RoundToInt(sizeY / Mathf.Max(itemSizeY, 0.0001f)));
+            var maxZ = Mathf.Max(1, Mathf.RoundToInt(sizeZ / Mathf.Max(itemSizeZ, 0.0001f)));
+            var perLayer = Mathf.Max(1, maxY * maxZ);
+
+            var desiredX = Mathf.Max(1, Mathf.CeilToInt((float)desiredCapacity / perLayer));
+            if (desiredX == defaultMaxX)
+                return;
+
+            var newItemSizeX = (float)sizeX / desiredX;
+            newItemSizeX = Mathf.Clamp(newItemSizeX, 0.01f, sizeX);
+
+            ShelfCompartmentCurrentItemSizeXField.SetValue(compartment, newItemSizeX);
+            SafeAppendDebug($"Adjust shelf layout for '{data.TargetName}': desired={desiredCapacity}, defaultMaxX={defaultMaxX}, perLayer={perLayer}, newMaxX={desiredX}, sizeX={sizeX}, itemSizeX={currentItemSizeX:F3}->{newItemSizeX:F3}");
+        }
+
+        internal void RecordShelfSlotSnapshot(ShelfCompartment compartment, MeshOverrideData data, string meshName, int slotKey, int anchors)
+        {
+            var slotState = EnsureShelfSlotState(data, slotKey, anchors);
+            if (slotState == null)
+                return;
+
+            var maxItemX = ShelfCompartmentMaxItemXField != null ? Convert.ToInt32(ShelfCompartmentMaxItemXField.GetValue(compartment)) : 0;
+            var maxItemY = ShelfCompartmentMaxItemYField != null ? Convert.ToInt32(ShelfCompartmentMaxItemYField.GetValue(compartment)) : 0;
+            var maxItemZ = ShelfCompartmentMaxItemZField != null ? Convert.ToInt32(ShelfCompartmentMaxItemZField.GetValue(compartment)) : 0;
+            var maxItemCount = ShelfCompartmentMaxItemCountField != null ? Convert.ToInt32(ShelfCompartmentMaxItemCountField.GetValue(compartment)) : 0;
+
+            var sizeX = ShelfCompartmentSizeXField != null ? Convert.ToInt32(ShelfCompartmentSizeXField.GetValue(compartment)) : 0;
+            var sizeY = ShelfCompartmentSizeYField != null ? Convert.ToInt32(ShelfCompartmentSizeYField.GetValue(compartment)) : 0;
+            var sizeZ = ShelfCompartmentSizeZField != null ? Convert.ToInt32(ShelfCompartmentSizeZField.GetValue(compartment)) : 0;
+
+            var currentSizeX = ShelfCompartmentCurrentItemSizeXField != null ? Convert.ToSingle(ShelfCompartmentCurrentItemSizeXField.GetValue(compartment)) : 0f;
+            var currentSizeY = ShelfCompartmentCurrentItemSizeYField != null ? Convert.ToSingle(ShelfCompartmentCurrentItemSizeYField.GetValue(compartment)) : 0f;
+            var currentSizeZ = ShelfCompartmentCurrentItemSizeZField != null ? Convert.ToSingle(ShelfCompartmentCurrentItemSizeZField.GetValue(compartment)) : 0f;
+
+            var posListCount = 0;
+            if (ShelfCompartmentTransformPosListField != null && ShelfCompartmentTransformPosListField.GetValue(compartment) is System.Collections.ICollection transforms)
+            {
+                posListCount = transforms.Count;
+            }
+
+            SafeAppendDebug($"Shelf slot snapshot for '{meshName}' (slot {slotKey}): anchors={anchors}, default={slotState.DefaultCapacity}, desired={data.DesiredShelfCapacity}, max=({maxItemX}x{maxItemY}x{maxItemZ}={maxItemCount}), size=({sizeX},{sizeY},{sizeZ}), itemSize=({currentSizeX:F3},{currentSizeY:F3},{currentSizeZ:F3}), posList={posListCount}");
+        }
+
+        private void RefreshShelfSlotAllocations(MeshOverrideData data)
+        {
+            if (data == null || !data.ShelfAllocationsDirty)
+                return;
+
+            data.ShelfAllocationsDirty = false;
+
+            var desiredPerSlot = data.DesiredShelfCapacity;
+            foreach (var slot in data.ShelfSlots.Values)
+            {
+                if (slot != null)
+                    slot.DesiredCapacity = desiredPerSlot;
+            }
+        }
+
+        internal bool TryGetShelfOverride(ShelfCompartment compartment, out MeshOverrideData data, out string meshName)
+        {
+            data = null;
+            meshName = GetShelfMeshName(compartment);
+            if (string.IsNullOrEmpty(meshName))
+                return false;
+
+            return _meshOverridesByTarget.TryGetValue(meshName, out data) && data != null;
         }
 
         private void CleanupMeshFilterEntries()
@@ -3602,6 +4317,7 @@ namespace CustomTextureReplacer
                 _meshFilterReferences.Remove(id);
                 _meshFilterOriginalMeshes.Remove(id);
                 _meshFilterOverrideIds.Remove(id);
+                _meshInstanceTargetByComponent.Remove(id);
             }
         }
 
@@ -3621,6 +4337,7 @@ namespace CustomTextureReplacer
                 _skinnedRendererReferences.Remove(id);
                 _skinnedOriginalMeshes.Remove(id);
                 _skinnedRendererOverrideIds.Remove(id);
+                _meshInstanceTargetByComponent.Remove(id);
             }
         }
 
@@ -3640,6 +4357,7 @@ namespace CustomTextureReplacer
                 _meshColliderReferences.Remove(id);
                 _meshColliderOriginalMeshes.Remove(id);
                 _meshColliderOverrideIds.Remove(id);
+                _meshInstanceTargetByComponent.Remove(id);
             }
         }
 
@@ -3744,6 +4462,98 @@ namespace CustomTextureReplacer
             }
 
             return false;
+        }
+
+        internal void HandleTextLabelUpdate(TMP_Text text)
+        {
+            if (text == null || !HasAnyCardOverrides() || _applyingLabelOverride)
+                return;
+
+            string label;
+            try
+            {
+                label = text.text;
+            }
+            catch
+            {
+                return;
+            }
+
+            if (string.IsNullOrEmpty(label))
+                return;
+
+            var entry = FindCardOverride(null, label);
+            if (entry == null || !entry.IsMeshOverride)
+                return;
+
+            var id = text.GetInstanceID();
+            var targetLabel = entry.DisplayName ?? string.Empty;
+
+            if (_lastAppliedMeshLabels.TryGetValue(id, out var lastApplied) &&
+                string.Equals(lastApplied, targetLabel, StringComparison.Ordinal))
+            {
+                return;
+            }
+
+            if (string.Equals(label, targetLabel, StringComparison.Ordinal))
+            {
+                CacheMeshLabelReference(text, id, targetLabel);
+                return;
+            }
+
+            _applyingLabelOverride = true;
+            try
+            {
+                ReplaceNameLabel(text, entry, label);
+                CacheMeshLabelReference(text, id, targetLabel);
+
+                if (_enableDebugLog != null && _enableDebugLog.Value)
+                {
+                    var path = GetTransformPath(text.transform, MeshLabelSearchParentDepth + 4);
+                    SafeAppendDebug($"Global label override applied: '{label}' -> '{targetLabel}' @ {path}");
+                }
+            }
+            finally
+            {
+                _applyingLabelOverride = false;
+            }
+        }
+
+        private void CacheMeshLabelReference(TMP_Text text, int id, string targetLabel)
+        {
+            _lastAppliedMeshLabels[id] = targetLabel;
+            if (!_meshLabelTextRefs.TryGetValue(id, out var weak) || !weak.TryGetTarget(out var existing) || !ReferenceEquals(existing, text))
+            {
+                _meshLabelTextRefs[id] = new WeakReference<TMP_Text>(text);
+            }
+
+            if (--_meshLabelCleanupBudget <= 0)
+            {
+                CleanupMeshLabelCache();
+            }
+        }
+
+        private void CleanupMeshLabelCache()
+        {
+            _meshLabelCleanupScratch.Clear();
+            foreach (var pair in _meshLabelTextRefs)
+            {
+                if (!pair.Value.TryGetTarget(out var target) || target == null)
+                {
+                    _meshLabelCleanupScratch.Add(pair.Key);
+                }
+            }
+
+            if (_meshLabelCleanupScratch.Count > 0)
+            {
+                foreach (var id in _meshLabelCleanupScratch)
+                {
+                    _meshLabelTextRefs.Remove(id);
+                    _lastAppliedMeshLabels.Remove(id);
+                }
+            }
+
+            _meshLabelCleanupBudget = Math.Max(_meshLabelTextRefs.Count / 2, 128);
         }
 
         private void CollectCandidateTextures(List<Texture2D> destination)
@@ -4032,7 +4842,7 @@ namespace CustomTextureReplacer
             }
         }
 
-        private sealed class MeshOverrideData
+        internal sealed class MeshOverrideData
         {
             public string TargetName;
             public string MeshAssetName;
@@ -4046,10 +4856,25 @@ namespace CustomTextureReplacer
             public bool ApplyToSkinnedMeshRenderer;
             public bool ApplyToMeshCollider;
             public List<MaterialOverrideData> MaterialOverrides { get; } = new List<MaterialOverrideData>();
+            public int DesiredInstanceCount = -1;
+            public int DesiredShelfCapacity = -1;
+            public bool ShelfAllocationsDirty = true;
+            public HashSet<int> InstanceIds { get; } = new HashSet<int>();
+            public List<WeakReference<GameObject>> InstanceReferences { get; } = new List<WeakReference<GameObject>>();
+            public HashSet<int> HiddenInstanceIds { get; } = new HashSet<int>();
+            public Dictionary<int, ShelfSlotState> ShelfSlots { get; } = new Dictionary<int, ShelfSlotState>();
             public CardTextOverride CardOverride;
         }
 
-        private sealed class MaterialOverrideData
+        internal sealed class ShelfSlotState
+        {
+            public int DefaultCapacity = -1;
+            public int DesiredCapacity = -1;
+            public int LastAnchorCount = -1;
+            public int LastItemCount = -1;
+        }
+
+        internal sealed class MaterialOverrideData
         {
             public int Slot;
             public string MaterialAssetName;
@@ -4058,14 +4883,14 @@ namespace CustomTextureReplacer
             public List<MaterialTextureAssignment> TextureAssignments { get; } = new List<MaterialTextureAssignment>();
         }
 
-        private sealed class MaterialTextureAssignment
+        internal sealed class MaterialTextureAssignment
         {
             public string PropertyName;
             public string FilePath;
             public Texture Texture;
         }
 
-        private sealed class PersistentSpriteOverride
+        internal sealed class PersistentSpriteOverride
         {
             public string SpriteName;
             public string TargetTextureName;
@@ -4146,6 +4971,9 @@ namespace CustomTextureReplacer
             if (string.IsNullOrEmpty(_debugLogFile))
                 return;
 
+            if (_enableDebugLog != null && !_enableDebugLog.Value)
+                return;
+
             try
             {
                 File.AppendAllText(_debugLogFile, $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] {message}{Environment.NewLine}");
@@ -4154,6 +4982,20 @@ namespace CustomTextureReplacer
             {
                 // ignore file IO errors
             }
+        }
+
+        internal bool ShouldSuppressLog(string message)
+        {
+            if (string.IsNullOrEmpty(message))
+                return false;
+
+            if (_suppressRectTransformWarning != null && _suppressRectTransformWarning.Value &&
+                message.IndexOf("Parent of RectTransform is being set with parent property", StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                return true;
+            }
+
+            return false;
         }
 
         private bool HasAnyCardOverrides()
@@ -4177,7 +5019,6 @@ namespace CustomTextureReplacer
                 return;
 
             _cardOverrides[trimmed] = entry;
-            RecordStoreLabel(trimmed);
             if (!string.IsNullOrEmpty(source))
             {
                 SafeAppendDebug($"CardOverrides alias '{trimmed}' mapped to '{entry.Id}' via {source}.");
@@ -4193,6 +5034,8 @@ namespace CustomTextureReplacer
             if (entry == null || string.IsNullOrEmpty(entry.Id))
                 return;
 
+            entry.IsMeshOverride = true;
+
             void AddAlias(string alias)
             {
                 if (string.IsNullOrWhiteSpace(alias))
@@ -4203,7 +5046,6 @@ namespace CustomTextureReplacer
                     return;
 
                 _meshCardOverrides[trimmed] = entry;
-                RecordStoreLabel(trimmed);
             }
 
             AddAlias(entry.Id);
@@ -4845,6 +5687,8 @@ namespace CustomTextureReplacer
                 {
                     ApplyItemPriceGraphOverrides(screen);
                 }
+
+                ReapplyMeshInstanceNameOverrides();
             }
             catch (Exception ex)
             {
@@ -4954,7 +5798,6 @@ namespace CustomTextureReplacer
                     return;
 
                 var originalLabel = nameText.text;
-                RecordStoreLabel(originalLabel);
                 var cardUI = CheckPricePanelUIBindings.CardUIField?.GetValue(panel) as CardUI;
                 var entry = FindCardOverride(cardUI, originalLabel);
                 if (entry == null)
@@ -4978,7 +5821,6 @@ namespace CustomTextureReplacer
             {
                 if (string.IsNullOrEmpty(originalLabel))
                     return;
-                RecordStoreLabel(originalLabel);
 
                 if (CheckoutItemBarBindings.NameTextField?.GetValue(itemBar) is not TMP_Text nameText)
                     return;
@@ -5007,7 +5849,6 @@ namespace CustomTextureReplacer
                     return;
 
                 var originalLabel = nameText.text;
-                RecordStoreLabel(originalLabel);
                 var cardUI = ItemPriceGraphScreenBindings.CardUIField?.GetValue(screen) as CardUI;
                 var entry = FindCardOverride(cardUI, originalLabel);
                 if (entry == null)
@@ -5026,9 +5867,6 @@ namespace CustomTextureReplacer
         {
             if (!HasAnyCardOverrides())
                 return null;
-
-            if (!string.IsNullOrEmpty(label))
-                RecordStoreLabel(label);
 
             if (cardUI != null)
             {
@@ -5086,33 +5924,6 @@ namespace CustomTextureReplacer
             return candidate.Trim();
         }
 
-        private static string GetNameSuffix(string label)
-        {
-            if (string.IsNullOrEmpty(label))
-                return string.Empty;
-
-            var separatorIndex = label.IndexOf(" - ", StringComparison.Ordinal);
-            return separatorIndex >= 0 ? label.Substring(separatorIndex) : string.Empty;
-        }
-
-        private void RecordStoreLabel(string label)
-        {
-            if (string.IsNullOrWhiteSpace(label))
-                return;
-
-            var normalised = GetNamePrefix(label);
-            if (string.IsNullOrEmpty(normalised))
-                normalised = label;
-
-            normalised = normalised.Replace("\r\n", "\n").Trim();
-            if (string.IsNullOrEmpty(normalised))
-                return;
-
-            if (_observedStoreLabels.Add(normalised))
-            {
-                SafeAppendDebug($"Observed store label '{normalised}'");
-            }
-        }
 
         private void ReplaceNameLabel(TMP_Text text, CardTextOverride entry, string originalLabel)
         {
@@ -5154,6 +5965,18 @@ namespace CustomTextureReplacer
                 textComponent.text = formatted;
             }
         }
+
+        private static string GetNameSuffix(string label)
+        {
+            if (string.IsNullOrEmpty(label))
+                return string.Empty;
+
+            var separatorIndex = label.IndexOf(" - ", StringComparison.Ordinal);
+            return separatorIndex >= 0 ? label.Substring(separatorIndex) : string.Empty;
+        }
+
+
+
 
         private void DumpOriginalCardData()
         {
@@ -5256,7 +6079,7 @@ namespace CustomTextureReplacer
             internal static readonly FieldInfo CardUIField = AccessTools.Field(typeof(ItemPriceGraphScreen), "m_CardUI");
         }
 
-        private class CardTextOverride
+        internal class CardTextOverride
         {
             public string Id;
             public string[] Aliases;
@@ -5272,6 +6095,7 @@ namespace CustomTextureReplacer
             public string Stat4;
             public string Rarity;
             public string Fame;
+            public bool IsMeshOverride;
         }
 
         private static object TryGetMemberValue(object target, string memberName)
@@ -5601,7 +6425,121 @@ namespace CustomTextureReplacer
             ReplacerController.Instance?.ApplyTextureOverrideToRawImage(__instance, value);
         }
     }
+    [HarmonyPatch(typeof(ShelfCompartment))]
+    internal static class ShelfCompartmentCalculatePositionListPatch
+    {
+        private struct SizeState
+        {
+            public bool HasOverride;
+            public float OriginalItemSizeX;
+            public float OriginalItemSizeY;
+            public float OriginalItemSizeZ;
+        }
 
+        [HarmonyPrefix]
+        [HarmonyPatch("CalculatePositionList")]
+        private static void CalculatePositionListPrefix(ShelfCompartment __instance, ref SizeState __state)
+        {
+            __state = default;
+
+            var controller = ReplacerController.Instance;
+            if (controller == null)
+                return;
+
+            if (!controller.TryGetShelfOverride(__instance, out var data, out _))
+                return;
+
+            if (data == null || data.DesiredShelfCapacity < 0)
+                return;
+
+            __state.HasOverride = true;
+            __state.OriginalItemSizeX = float.NaN;
+            __state.OriginalItemSizeY = float.NaN;
+            __state.OriginalItemSizeZ = float.NaN;
+
+            if (ReplacerController.ShelfCompartmentCurrentItemSizeXField != null)
+            {
+                var value = ReplacerController.ShelfCompartmentCurrentItemSizeXField.GetValue(__instance);
+                if (value is float f)
+                    __state.OriginalItemSizeX = f;
+            }
+
+            if (ReplacerController.ShelfCompartmentCurrentItemSizeYField != null)
+            {
+                var value = ReplacerController.ShelfCompartmentCurrentItemSizeYField.GetValue(__instance);
+                if (value is float f)
+                    __state.OriginalItemSizeY = f;
+            }
+
+            if (ReplacerController.ShelfCompartmentCurrentItemSizeZField != null)
+            {
+                var value = ReplacerController.ShelfCompartmentCurrentItemSizeZField.GetValue(__instance);
+                if (value is float f)
+                    __state.OriginalItemSizeZ = f;
+            }
+
+            controller.ApplyShelfLayoutScaling(__instance, data, data.DesiredShelfCapacity);
+        }
+
+        [HarmonyPostfix]
+        [HarmonyPatch("CalculatePositionList")]
+        private static void CalculatePositionListPostfix(ShelfCompartment __instance, SizeState __state)
+        {
+            if (!__state.HasOverride)
+                return;
+
+            var controller = ReplacerController.Instance;
+            if (controller == null)
+            {
+                RestoreOriginalShelfItemSizes(__instance, __state);
+                return;
+            }
+
+            if (!controller.TryGetShelfOverride(__instance, out var data, out var meshName))
+            {
+                RestoreOriginalShelfItemSizes(__instance, __state);
+                return;
+            }
+
+            var anchors = controller.GetShelfAnchorCount(__instance);
+            var slotKey = controller.GetShelfSlotKey(__instance);
+            controller.RecordShelfSlotSnapshot(__instance, data, meshName, slotKey, anchors);
+
+            RestoreOriginalShelfItemSizes(__instance, __state);
+        }
+
+        private static void RestoreOriginalShelfItemSizes(ShelfCompartment compartment, SizeState state)
+        {
+            if (!state.HasOverride || compartment == null)
+                return;
+
+            if (!float.IsNaN(state.OriginalItemSizeX) && ReplacerController.ShelfCompartmentCurrentItemSizeXField != null)
+            {
+                ReplacerController.ShelfCompartmentCurrentItemSizeXField.SetValue(compartment, state.OriginalItemSizeX);
+            }
+
+            if (!float.IsNaN(state.OriginalItemSizeY) && ReplacerController.ShelfCompartmentCurrentItemSizeYField != null)
+            {
+                ReplacerController.ShelfCompartmentCurrentItemSizeYField.SetValue(compartment, state.OriginalItemSizeY);
+            }
+
+            if (!float.IsNaN(state.OriginalItemSizeZ) && ReplacerController.ShelfCompartmentCurrentItemSizeZField != null)
+            {
+                ReplacerController.ShelfCompartmentCurrentItemSizeZField.SetValue(compartment, state.OriginalItemSizeZ);
+            }
+        }
+    }
+
+    [HarmonyPatch(typeof(ShelfCompartment))]
+    internal static class ShelfCompartmentPatches
+    {
+        [HarmonyPrefix]
+        [HarmonyPatch("SpawnItem")]
+        private static void SpawnItemPrefix(ShelfCompartment __instance, ref int amount)
+        {
+            ReplacerController.Instance?.AdjustShelfSpawn(__instance, ref amount);
+        }
+    }
     [HarmonyPatch(typeof(MeshFilter))]
     internal static class MeshFilterPatches
     {
@@ -5715,7 +6653,6 @@ namespace CustomTextureReplacer
             return false;
         }
     }
-
     [HarmonyPatch(typeof(CardUI))]
     internal static class CardUIPatches
     {
@@ -5765,7 +6702,80 @@ namespace CustomTextureReplacer
         }
     }
 
+    [HarmonyPatch]
+    internal static class TMPTextPatches
+    {
+        private static IEnumerable<MethodBase> TargetMethods()
+        {
+            var setter = AccessTools.PropertySetter(typeof(TMP_Text), "text");
+            if (setter != null)
+                yield return setter;
+
+            var setTextBool = AccessTools.Method(typeof(TMP_Text), "SetText", new[] { typeof(string), typeof(bool) });
+            if (setTextBool != null)
+                yield return setTextBool;
+
+            var setText = AccessTools.Method(typeof(TMP_Text), "SetText", new[] { typeof(string) });
+            if (setText != null)
+                yield return setText;
+        }
+
+        private static void Postfix(TMP_Text __instance)
+        {
+            ReplacerController.Instance?.HandleTextLabelUpdate(__instance);
+        }
+    }
+
+    [HarmonyPatch(typeof(Debug))]
+    internal static class DebugLogWarningPatches
+    {
+        [HarmonyPrefix]
+        [HarmonyPatch(nameof(Debug.LogWarning), new[] { typeof(object) })]
+        private static bool LogWarningPrefix(object message)
+        {
+            return !ShouldSuppress(message);
+        }
+
+        [HarmonyPrefix]
+        [HarmonyPatch(nameof(Debug.LogWarning), new[] { typeof(object), typeof(UnityEngine.Object) })]
+        private static bool LogWarningContextPrefix(object message, UnityEngine.Object context)
+        {
+            return !ShouldSuppress(message);
+        }
+
+        [HarmonyPrefix]
+        [HarmonyPatch(nameof(Debug.LogWarningFormat), new[] { typeof(string), typeof(object[]) })]
+        private static bool LogWarningFormatPrefix(string format, params object[] args)
+        {
+            return !ShouldSuppress(format);
+        }
+
+        [HarmonyPrefix]
+        [HarmonyPatch(nameof(Debug.LogWarningFormat), new[] { typeof(UnityEngine.Object), typeof(string), typeof(object[]) })]
+        private static bool LogWarningFormatContextPrefix(UnityEngine.Object context, string format, params object[] args)
+        {
+            return !ShouldSuppress(format);
+        }
+
+        private static bool ShouldSuppress(object candidate)
+        {
+            var controller = ReplacerController.Instance;
+            if (controller == null)
+                return false;
+
+            var message = candidate as string ?? candidate?.ToString();
+            return controller.ShouldSuppressLog(message);
+        }
+    }
+
 }
+
+
+
+
+
+
+
 
 
 

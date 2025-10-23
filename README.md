@@ -48,7 +48,8 @@ Mesh swapping uses Unity asset bundles (built for the same Unity version as the 
   "overrides": [
     {
       "target": "PiggyA_Mesh",
-      "bundle": "dark_knight_armored.bundle"
+      "bundle": "dark_knight_armored.bundle",
+      "shelfCount": 2
     }
   ]
 }
@@ -64,6 +65,7 @@ The loader picks the most complex mesh in the bundle and assigns enough material
       "bundle": "dark_knight_armored.bundle",
       "meshHint": "Armored",
       "materialHints": ["Body", "Head", "Pack"],
+      "shelfCount": 3,
       "card": {
         "displayName": "Armored Batman Statue",
         "aliases": ["Pigni Plushie"]
@@ -74,6 +76,8 @@ The loader picks the most complex mesh in the bundle and assigns enough material
 ```
 
 `meshHint` narrows the auto mesh selection by name (case-insensitive). `materialHints` prioritises materials whose names contain each hint. If the loader still cannot determine a unique mesh or enough materials, it logs a warning so you can fall back to explicit names.
+
+`shelfCount` (optional) clamps how many instances of the mesh stay active for each parent shelf/root. Extra duplicates are deactivated, newly spawned copies respect the same limit, and omitting the key (or setting `-1`) leaves the original layout untouched.
 ## Editing Card Metadata
 
 Create a `CardOverrides.json` with the following structure:
@@ -185,5 +189,4 @@ Ensure `Card Shop Simulator_Data/Managed` is accessible so the build references 
 - Plugin author: Duckieray
 - Enhancements and maintenance: community contributors
 - Powered by BepInEx 5 + Harmony 2
-
 
