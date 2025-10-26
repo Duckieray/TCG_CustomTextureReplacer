@@ -129,12 +129,18 @@ namespace CustomTextureReplacer
         private readonly HashSet<string> _meshTextureFolders = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         private readonly Dictionary<int, WeakReference<MeshFilter>> _meshFilterReferences = new Dictionary<int, WeakReference<MeshFilter>>();
         private readonly Dictionary<int, Mesh> _meshFilterOriginalMeshes = new Dictionary<int, Mesh>();
+        private readonly Dictionary<int, string> _meshFilterOriginalMeshNames = new Dictionary<int, string>();
+        private readonly HashSet<int> _meshFilterMissingOriginalLogged = new HashSet<int>();
         private readonly HashSet<int> _meshFilterOverrideIds = new HashSet<int>();
         private readonly Dictionary<int, WeakReference<SkinnedMeshRenderer>> _skinnedRendererReferences = new Dictionary<int, WeakReference<SkinnedMeshRenderer>>();
         private readonly Dictionary<int, Mesh> _skinnedOriginalMeshes = new Dictionary<int, Mesh>();
+        private readonly Dictionary<int, string> _skinnedOriginalMeshNames = new Dictionary<int, string>();
+        private readonly HashSet<int> _skinnedMissingOriginalLogged = new HashSet<int>();
         private readonly HashSet<int> _skinnedRendererOverrideIds = new HashSet<int>();
         private readonly Dictionary<int, WeakReference<MeshCollider>> _meshColliderReferences = new Dictionary<int, WeakReference<MeshCollider>>();
         private readonly Dictionary<int, Mesh> _meshColliderOriginalMeshes = new Dictionary<int, Mesh>();
+        private readonly Dictionary<int, string> _meshColliderOriginalMeshNames = new Dictionary<int, string>();
+        private readonly HashSet<int> _meshColliderMissingOriginalLogged = new HashSet<int>();
         private readonly HashSet<int> _meshColliderOverrideIds = new HashSet<int>();
         private readonly Dictionary<int, WeakReference<Renderer>> _rendererReferences = new Dictionary<int, WeakReference<Renderer>>();
         private readonly Dictionary<int, Material[]> _rendererOriginalMaterials = new Dictionary<int, Material[]>();
@@ -2740,51 +2746,295 @@ namespace CustomTextureReplacer
                 return false;
             }
 
-            var selection = new List<Material>();
-            if (data.MaterialSelectionHints != null)
+            if (TryPopulateMaterialsFromPrefabs(data, bundle, materials, subMeshCount, logDetails))
             {
-                foreach (var hint in data.MaterialSelectionHints)
-                {
-                    if (string.IsNullOrWhiteSpace(hint))
-                        continue;
-                    var match = materials.FirstOrDefault(mat => mat != null && mat.name.IndexOf(hint, StringComparison.OrdinalIgnoreCase) >= 0);
-                    if (match != null && !selection.Contains(match))
-                        selection.Add(match);
-                }
+                data.AutoSelectMaterials = false;
+                return true;
             }
 
-            foreach (var mat in materials)
+            var candidates = BuildScoredMaterialList(data, materials);
+            if (candidates.Count == 0 && logDetails)
             {
-                if (mat != null && !selection.Contains(mat))
-                    selection.Add(mat);
+                _logger.LogInfo($"[CustomTextureReplacer] Auto material scoring produced 0 candidates for '{data.TargetName}' (hints={string.Join(",", data.MaterialSelectionHints ?? Array.Empty<string>())}).");
             }
-
-            if (subMeshCount <= 0)
-                subMeshCount = 1;
-
-            var required = Math.Min(selection.Count, subMeshCount);
-            if (required == 0)
+            if (candidates.Count == 0)
             {
                 _logger.LogWarning($"[CustomTextureReplacer] Unable to auto-select materials from bundle '{GetBundleDebugName(data.SourceBundlePath, bundle)}' for target '{data.TargetName}'. Provide explicit 'materials' or 'materialHints'.");
                 SafeAppendDebug($"Auto material selection produced no candidates for {data.TargetName}");
                 return false;
             }
 
+            if (subMeshCount <= 0)
+                subMeshCount = candidates.Count;
+
+            var required = Math.Max(1, subMeshCount);
+            if (logDetails)
+            {
+                var preview = string.Join(", ", candidates.Take(Math.Min(5, candidates.Count)).Select(mat => mat?.name ?? "<null>"));
+                _logger.LogInfo($"[CustomTextureReplacer] Using {required} auto-selected material slot(s) for '{data.TargetName}' (candidates={candidates.Count}: {preview}).");
+            }
             for (int slot = 0; slot < required; slot++)
             {
-                var materialAsset = selection[slot];
-                if (materialAsset == null)
+                var candidate = slot < candidates.Count ? candidates[slot] : candidates.Last();
+                if (candidate == null)
                     continue;
-                AddMaterialOverrideFromAsset(data, materialAsset, slot, logDetails);
+                if (slot >= candidates.Count && logDetails)
+                {
+                    _logger.LogInfo($"[CustomTextureReplacer] Reusing material '{candidate.name}' for slot {slot} (target '{data.TargetName}').");
+                }
+                AddMaterialOverrideFromAsset(data, candidate, slot, logDetails);
             }
 
             data.AutoSelectMaterials = false;
             return true;
         }
 
+        private bool TryPopulateMaterialsFromPrefabs(MeshOverrideData data, AssetBundle bundle, Material[] materials, int subMeshCount, bool logDetails)
+        {
+            if (string.IsNullOrEmpty(data?.MeshAssetName) || bundle == null)
+            {
+                if (logDetails)
+                    _logger.LogInfo($"[CustomTextureReplacer] Prefab material scan skipped for '{data?.TargetName}' (missing mesh name or bundle).");
+                return false;
+            }
+
+            GameObject[] prefabs;
+            try
+            {
+                prefabs = bundle.LoadAllAssets<GameObject>();
+            }
+            catch
+            {
+                if (logDetails)
+                    _logger.LogInfo($"[CustomTextureReplacer] Prefab material scan failed to enumerate prefabs for '{data.TargetName}'.");
+                return false;
+            }
+
+            if (prefabs == null || prefabs.Length == 0)
+            {
+                if (logDetails)
+                    _logger.LogInfo($"[CustomTextureReplacer] Prefab material scan found no prefabs in bundle for '{data.TargetName}'.");
+                return false;
+            }
+
+            var matchedMaterials = new List<Material>();
+
+            foreach (var prefab in prefabs)
+            {
+                if (prefab == null)
+                    continue;
+
+                try
+                {
+                    foreach (var renderer in prefab.GetComponentsInChildren<Renderer>(true))
+                    {
+                        if (renderer == null)
+                            continue;
+
+                        Mesh mesh = null;
+                        if (renderer is SkinnedMeshRenderer skinned)
+                        {
+                            mesh = skinned.sharedMesh;
+                        }
+                        else if (renderer.TryGetComponent<MeshFilter>(out var filter))
+                        {
+                            mesh = filter.sharedMesh;
+                        }
+
+                        if (mesh == null)
+                            continue;
+
+                        if (!MeshMatchesTarget(mesh, data))
+                            continue;
+
+                        var rendererMaterials = renderer.sharedMaterials ?? Array.Empty<Material>();
+                        matchedMaterials.AddRange(rendererMaterials.Where(mat => mat != null));
+                        if (matchedMaterials.Count > 0)
+                            break;
+                    }
+                }
+                catch
+                {
+                    // ignore malformed prefabs
+                }
+
+                if (matchedMaterials.Count > 0)
+                    break;
+            }
+
+            if (matchedMaterials.Count == 0)
+            {
+                if (logDetails)
+                    _logger.LogInfo($"[CustomTextureReplacer] Prefab material scan found no renderer using mesh '{data.MeshAssetName}' for '{data.TargetName}'.");
+                return false;
+            }
+
+            var required = matchedMaterials.Count;
+            for (int slot = 0; slot < required; slot++)
+            {
+                var rendererMat = matchedMaterials[slot];
+                if (rendererMat == null)
+                    continue;
+
+                var assetMat = FindMatchingMaterialAsset(rendererMat, materials);
+                var chosen = assetMat ?? rendererMat;
+                if (logDetails)
+                {
+                    var sourceName = rendererMat?.name ?? "<null>";
+                    var assetName = assetMat?.name ?? "<renderer>";
+                    _logger.LogInfo($"[CustomTextureReplacer] Prefab mapping slot {slot}: renderer '{sourceName}' -> asset '{assetName}' for '{data.TargetName}'.");
+                }
+                AddMaterialOverrideFromAsset(data, chosen, slot, logDetails);
+            }
+
+            if (subMeshCount > 0 && required != subMeshCount)
+            {
+                _logger.LogInfo($"[CustomTextureReplacer] Prefab material count ({required}) differs from mesh sub-meshes ({subMeshCount}) for '{data.TargetName}'. Using prefab ordering.");
+            }
+
+            return data.MaterialOverrides.Count > 0;
+        }
+
+        private static Material FindMatchingMaterialAsset(Material rendererMaterial, Material[] candidates)
+        {
+            if (rendererMaterial == null || candidates == null || candidates.Length == 0)
+                return null;
+
+            foreach (var candidate in candidates)
+            {
+                if (ReferenceEquals(candidate, rendererMaterial))
+                    return candidate;
+            }
+
+            var name = rendererMaterial.name;
+            if (string.IsNullOrEmpty(name))
+                return null;
+
+            foreach (var candidate in candidates)
+            {
+                if (candidate != null && string.Equals(candidate.name, name, StringComparison.OrdinalIgnoreCase))
+                    return candidate;
+            }
+
+            return null;
+        }
+
+        private bool MeshMatchesTarget(Mesh mesh, MeshOverrideData data)
+        {
+            if (mesh == null || data == null)
+                return false;
+
+            var meshName = NormalizeAssetName(mesh.name);
+
+            if (!string.IsNullOrEmpty(data.MeshAssetName))
+            {
+                var targetMeshName = NormalizeAssetName(data.MeshAssetName);
+                if (!string.IsNullOrEmpty(targetMeshName) &&
+                    string.Equals(meshName, targetMeshName, StringComparison.OrdinalIgnoreCase))
+                {
+                    return true;
+                }
+
+                if (!string.IsNullOrEmpty(targetMeshName) &&
+                    meshName.IndexOf(targetMeshName, StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    return true;
+                }
+            }
+
+            if (!string.IsNullOrEmpty(data.MeshSelectionHint) &&
+                meshName.IndexOf(data.MeshSelectionHint, StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                return true;
+            }
+
+            if (!string.IsNullOrEmpty(data.TargetName) &&
+                meshName.IndexOf(data.TargetName, StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                return true;
+            }
+
+            return false;
+        }
+
+        private static string NormalizeAssetName(string name)
+        {
+            if (string.IsNullOrEmpty(name))
+                return string.Empty;
+
+            var normalized = name.Replace("(Clone)", string.Empty);
+            normalized = normalized.Trim();
+            return normalized;
+        }
+
+        private List<Material> BuildScoredMaterialList(MeshOverrideData data, Material[] materials)
+        {
+            var result = new List<(Material material, float score)>();
+            if (materials == null)
+                return new List<Material>();
+
+            for (int i = 0; i < materials.Length; i++)
+            {
+                var mat = materials[i];
+                if (mat == null)
+                    continue;
+
+                var name = mat.name ?? string.Empty;
+                var score = 0f;
+
+                if (data.MaterialSelectionHints != null)
+                {
+                    for (int hintIndex = 0; hintIndex < data.MaterialSelectionHints.Length; hintIndex++)
+                    {
+                        var hint = data.MaterialSelectionHints[hintIndex];
+                        if (string.IsNullOrWhiteSpace(hint))
+                            continue;
+                        if (name.IndexOf(hint, StringComparison.OrdinalIgnoreCase) >= 0)
+                        {
+                            score += 100f - hintIndex;
+                        }
+                    }
+                }
+
+                if (!string.IsNullOrEmpty(data.MeshAssetName) && name.IndexOf(data.MeshAssetName, StringComparison.OrdinalIgnoreCase) >= 0)
+                    score += 60f;
+
+                if (!string.IsNullOrEmpty(data.TargetName) && name.IndexOf(data.TargetName, StringComparison.OrdinalIgnoreCase) >= 0)
+                    score += 40f;
+
+                if (!string.IsNullOrEmpty(data.MeshSelectionHint) && name.IndexOf(data.MeshSelectionHint, StringComparison.OrdinalIgnoreCase) >= 0)
+                    score += 30f;
+
+                if (mat.mainTexture != null)
+                    score += 10f;
+
+                if (name.IndexOf("default", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                    name.IndexOf("unity", StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    score -= 15f;
+                }
+
+                if (score <= 0f && i < materials.Length)
+                {
+                    score += Math.Max(1f, 5f - i);
+                }
+
+                result.Add((mat, score));
+            }
+
+            return result
+                .OrderByDescending(entry => entry.score)
+                .ThenBy(entry => entry.material?.name, StringComparer.OrdinalIgnoreCase)
+                .Select(entry => entry.material)
+                .ToList();
+        }
+
         private void AddMaterialOverrideFromAsset(MeshOverrideData data, Material sourceMaterial, int slot, bool logDetails)
         {
             if (data == null || sourceMaterial == null)
+                return;
+
+            if (data.MaterialOverrides.Any(existing => existing != null && existing.Slot == slot))
                 return;
 
             Material instance = null;
@@ -3274,10 +3524,21 @@ namespace CustomTextureReplacer
             {
                 if (pair.Value.TryGetTarget(out var filter) && filter != null)
                 {
-                    if (_meshFilterOriginalMeshes.TryGetValue(pair.Key, out var original) && original != null)
+                    if (_meshFilterOriginalMeshes.TryGetValue(pair.Key, out var original))
                     {
+                        if (original == null)
+                        {
+                            _meshFilterOriginalMeshNames.TryGetValue(pair.Key, out var cachedName);
+                            LogMissingOriginal(_meshFilterMissingOriginalLogged, pair.Key, "MeshFilter", cachedName ?? filter.sharedMesh?.name ?? filter.name);
+                        }
+
                         if (!ReferenceEquals(filter.sharedMesh, original))
                             filter.sharedMesh = original;
+                    }
+                    else
+                    {
+                        _meshFilterOriginalMeshNames.TryGetValue(pair.Key, out var cachedName);
+                        LogMissingOriginal(_meshFilterMissingOriginalLogged, pair.Key, "MeshFilter", cachedName ?? filter.sharedMesh?.name ?? filter.name);
                     }
                 }
             }
@@ -3290,10 +3551,21 @@ namespace CustomTextureReplacer
             {
                 if (pair.Value.TryGetTarget(out var renderer) && renderer != null)
                 {
-                    if (_skinnedOriginalMeshes.TryGetValue(pair.Key, out var original) && original != null)
+                    if (_skinnedOriginalMeshes.TryGetValue(pair.Key, out var original))
                     {
+                        if (original == null)
+                        {
+                            _skinnedOriginalMeshNames.TryGetValue(pair.Key, out var cachedName);
+                            LogMissingOriginal(_skinnedMissingOriginalLogged, pair.Key, "SkinnedMeshRenderer", cachedName ?? renderer.sharedMesh?.name ?? renderer.name);
+                        }
+
                         if (!ReferenceEquals(renderer.sharedMesh, original))
                             renderer.sharedMesh = original;
+                    }
+                    else
+                    {
+                        _skinnedOriginalMeshNames.TryGetValue(pair.Key, out var cachedName);
+                        LogMissingOriginal(_skinnedMissingOriginalLogged, pair.Key, "SkinnedMeshRenderer", cachedName ?? renderer.sharedMesh?.name ?? renderer.name);
                     }
                 }
             }
@@ -3306,10 +3578,21 @@ namespace CustomTextureReplacer
             {
                 if (pair.Value.TryGetTarget(out var collider) && collider != null)
                 {
-                    if (_meshColliderOriginalMeshes.TryGetValue(pair.Key, out var original) && original != null)
+                    if (_meshColliderOriginalMeshes.TryGetValue(pair.Key, out var original))
                     {
+                        if (original == null)
+                        {
+                            _meshColliderOriginalMeshNames.TryGetValue(pair.Key, out var cachedName);
+                            LogMissingOriginal(_meshColliderMissingOriginalLogged, pair.Key, "MeshCollider", cachedName ?? collider.sharedMesh?.name ?? collider.name);
+                        }
+
                         if (!ReferenceEquals(collider.sharedMesh, original))
                             collider.sharedMesh = original;
+                    }
+                    else
+                    {
+                        _meshColliderOriginalMeshNames.TryGetValue(pair.Key, out var cachedName);
+                        LogMissingOriginal(_meshColliderMissingOriginalLogged, pair.Key, "MeshCollider", cachedName ?? collider.sharedMesh?.name ?? collider.name);
                     }
                 }
             }
@@ -3424,15 +3707,36 @@ namespace CustomTextureReplacer
                 {
                     _meshFilterReferences[id] = new WeakReference<MeshFilter>(filter);
                     _meshFilterOriginalMeshes[id] = filter.sharedMesh;
+                    RememberMeshFilterOriginalName(id, filter.sharedMesh, filter);
                 }
 
                 if (!_meshFilterOriginalMeshes.TryGetValue(id, out var originalMesh))
                 {
                     originalMesh = filter.sharedMesh;
                     _meshFilterOriginalMeshes[id] = originalMesh;
+                    RememberMeshFilterOriginalName(id, originalMesh, filter);
+                }
+                else if (originalMesh == null && !_meshFilterOverrideIds.Contains(id))
+                {
+                    var currentMesh = filter.sharedMesh;
+                    if (currentMesh != null)
+                    {
+                        originalMesh = currentMesh;
+                        _meshFilterOriginalMeshes[id] = currentMesh;
+                        RememberMeshFilterOriginalName(id, currentMesh, filter);
+                    }
+                }
+                else if (!_meshFilterOverrideIds.Contains(id) &&
+                         originalMesh != null &&
+                         filter.sharedMesh != null &&
+                         !ReferenceEquals(originalMesh, filter.sharedMesh))
+                {
+                    originalMesh = filter.sharedMesh;
+                    _meshFilterOriginalMeshes[id] = originalMesh;
+                    RememberMeshFilterOriginalName(id, originalMesh, filter);
                 }
 
-                var targetName = originalMesh != null ? originalMesh.name : filter.sharedMesh?.name;
+                var targetName = ResolveMeshFilterTargetName(id, filter, originalMesh);
                 if (!string.IsNullOrEmpty(targetName) &&
                     _meshOverridesByTarget.TryGetValue(targetName, out var overrideData) &&
                     overrideData != null)
@@ -3441,10 +3745,35 @@ namespace CustomTextureReplacer
 
                     if (overrideData.ApplyToMeshFilter)
                     {
+                        var currentMesh = filter.sharedMesh;
+                        var replacement = overrideData.MeshInstance;
+                        if (_meshFilterOverrideIds.Contains(id) &&
+                            currentMesh != null &&
+                            replacement != null &&
+                            !ReferenceEquals(currentMesh, replacement) &&
+                            !ReferenceEquals(currentMesh, originalMesh))
+                        {
+                            if (_meshInstanceTargetByComponent.TryGetValue(id, out var previousTarget) &&
+                                _meshOverridesByTarget.TryGetValue(previousTarget, out var previousData))
+                            {
+                                UnregisterMeshInstance(previousData, filter.gameObject);
+                            }
+                            _meshInstanceTargetByComponent.Remove(id);
+                            _meshFilterOverrideIds.Remove(id);
+                            _meshFilterOriginalMeshes[id] = currentMesh;
+                            RememberMeshFilterOriginalName(id, currentMesh, filter);
+                            var componentRenderer = filter.GetComponent<Renderer>();
+                            if (componentRenderer != null)
+                            {
+                                RestoreRendererMaterials(componentRenderer);
+                            }
+                            applied = true;
+                            continue;
+                        }
+
                         RegisterMeshInstance(overrideData, filter.gameObject);
                         _meshInstanceTargetByComponent[id] = overrideData.TargetName;
 
-                        var replacement = overrideData.MeshInstance;
                         if (replacement != null && !ReferenceEquals(filter.sharedMesh, replacement))
                         {
                             filter.sharedMesh = replacement;
@@ -3523,15 +3852,36 @@ namespace CustomTextureReplacer
                 {
                     _skinnedRendererReferences[id] = new WeakReference<SkinnedMeshRenderer>(renderer);
                     _skinnedOriginalMeshes[id] = renderer.sharedMesh;
+                    RememberSkinnedOriginalName(id, renderer.sharedMesh, renderer);
                 }
 
                 if (!_skinnedOriginalMeshes.TryGetValue(id, out var originalMesh))
                 {
                     originalMesh = renderer.sharedMesh;
                     _skinnedOriginalMeshes[id] = originalMesh;
+                    RememberSkinnedOriginalName(id, originalMesh, renderer);
+                }
+                else if (originalMesh == null && !_skinnedRendererOverrideIds.Contains(id))
+                {
+                    var currentMesh = renderer.sharedMesh;
+                    if (currentMesh != null)
+                    {
+                        originalMesh = currentMesh;
+                        _skinnedOriginalMeshes[id] = currentMesh;
+                        RememberSkinnedOriginalName(id, currentMesh, renderer);
+                    }
+                }
+                else if (!_skinnedRendererOverrideIds.Contains(id) &&
+                         originalMesh != null &&
+                         renderer.sharedMesh != null &&
+                         !ReferenceEquals(originalMesh, renderer.sharedMesh))
+                {
+                    originalMesh = renderer.sharedMesh;
+                    _skinnedOriginalMeshes[id] = originalMesh;
+                    RememberSkinnedOriginalName(id, originalMesh, renderer);
                 }
 
-                var targetName = originalMesh != null ? originalMesh.name : renderer.sharedMesh?.name;
+                var targetName = ResolveSkinnedTargetName(id, renderer, originalMesh);
                 if (!string.IsNullOrEmpty(targetName) &&
                     _meshOverridesByTarget.TryGetValue(targetName, out var overrideData) &&
                     overrideData != null)
@@ -3540,10 +3890,31 @@ namespace CustomTextureReplacer
 
                     if (overrideData.ApplyToSkinnedMeshRenderer)
                     {
+                        var currentMesh = renderer.sharedMesh;
+                        var replacement = overrideData.MeshInstance;
+                        if (_skinnedRendererOverrideIds.Contains(id) &&
+                            currentMesh != null &&
+                            replacement != null &&
+                            !ReferenceEquals(currentMesh, replacement) &&
+                            !ReferenceEquals(currentMesh, originalMesh))
+                        {
+                            if (_meshInstanceTargetByComponent.TryGetValue(id, out var previousTarget) &&
+                                _meshOverridesByTarget.TryGetValue(previousTarget, out var previousData))
+                            {
+                                UnregisterMeshInstance(previousData, renderer.gameObject);
+                            }
+                            _meshInstanceTargetByComponent.Remove(id);
+                            _skinnedRendererOverrideIds.Remove(id);
+                            _skinnedOriginalMeshes[id] = currentMesh;
+                            RememberSkinnedOriginalName(id, currentMesh, renderer);
+                            RestoreRendererMaterials(renderer);
+                            applied = true;
+                            continue;
+                        }
+
                         RegisterMeshInstance(overrideData, renderer.gameObject);
                         _meshInstanceTargetByComponent[id] = overrideData.TargetName;
 
-                        var replacement = overrideData.MeshInstance;
                         if (replacement != null && !ReferenceEquals(renderer.sharedMesh, replacement))
                         {
                             renderer.sharedMesh = replacement;
@@ -3616,15 +3987,36 @@ namespace CustomTextureReplacer
                 {
                     _meshColliderReferences[id] = new WeakReference<MeshCollider>(collider);
                     _meshColliderOriginalMeshes[id] = collider.sharedMesh;
+                    RememberColliderOriginalName(id, collider.sharedMesh, collider);
                 }
 
                 if (!_meshColliderOriginalMeshes.TryGetValue(id, out var originalMesh))
                 {
                     originalMesh = collider.sharedMesh;
                     _meshColliderOriginalMeshes[id] = originalMesh;
+                    RememberColliderOriginalName(id, originalMesh, collider);
+                }
+                else if (originalMesh == null && !_meshColliderOverrideIds.Contains(id))
+                {
+                    var currentMesh = collider.sharedMesh;
+                    if (currentMesh != null)
+                    {
+                        originalMesh = currentMesh;
+                        _meshColliderOriginalMeshes[id] = currentMesh;
+                        RememberColliderOriginalName(id, currentMesh, collider);
+                    }
+                }
+                else if (!_meshColliderOverrideIds.Contains(id) &&
+                         originalMesh != null &&
+                         collider.sharedMesh != null &&
+                         !ReferenceEquals(originalMesh, collider.sharedMesh))
+                {
+                    originalMesh = collider.sharedMesh;
+                    _meshColliderOriginalMeshes[id] = originalMesh;
+                    RememberColliderOriginalName(id, originalMesh, collider);
                 }
 
-                var targetName = originalMesh != null ? originalMesh.name : collider.sharedMesh?.name;
+                var targetName = ResolveMeshColliderTargetName(id, collider, originalMesh);
                 if (!string.IsNullOrEmpty(targetName) &&
                     _meshOverridesByTarget.TryGetValue(targetName, out var overrideData) &&
                     overrideData != null)
@@ -3633,10 +4025,30 @@ namespace CustomTextureReplacer
 
                     if (overrideData.ApplyToMeshCollider)
                     {
+                        var currentMesh = collider.sharedMesh;
+                        var replacement = overrideData.MeshInstance;
+                        if (_meshColliderOverrideIds.Contains(id) &&
+                            currentMesh != null &&
+                            replacement != null &&
+                            !ReferenceEquals(currentMesh, replacement) &&
+                            !ReferenceEquals(currentMesh, originalMesh))
+                        {
+                            if (_meshInstanceTargetByComponent.TryGetValue(id, out var previousTarget) &&
+                                _meshOverridesByTarget.TryGetValue(previousTarget, out var previousData))
+                            {
+                                UnregisterMeshInstance(previousData, collider.gameObject);
+                            }
+                            _meshInstanceTargetByComponent.Remove(id);
+                            _meshColliderOverrideIds.Remove(id);
+                            _meshColliderOriginalMeshes[id] = currentMesh;
+                            RememberColliderOriginalName(id, currentMesh, collider);
+                            applied = true;
+                            continue;
+                        }
+
                         RegisterMeshInstance(overrideData, collider.gameObject);
                         _meshInstanceTargetByComponent[id] = overrideData.TargetName;
 
-                        var replacement = overrideData.MeshInstance;
                         if (replacement != null && !ReferenceEquals(collider.sharedMesh, replacement))
                         {
                             collider.sharedMesh = replacement;
@@ -4316,6 +4728,8 @@ namespace CustomTextureReplacer
             {
                 _meshFilterReferences.Remove(id);
                 _meshFilterOriginalMeshes.Remove(id);
+                _meshFilterOriginalMeshNames.Remove(id);
+                _meshFilterMissingOriginalLogged.Remove(id);
                 _meshFilterOverrideIds.Remove(id);
                 _meshInstanceTargetByComponent.Remove(id);
             }
@@ -4336,6 +4750,8 @@ namespace CustomTextureReplacer
             {
                 _skinnedRendererReferences.Remove(id);
                 _skinnedOriginalMeshes.Remove(id);
+                _skinnedOriginalMeshNames.Remove(id);
+                _skinnedMissingOriginalLogged.Remove(id);
                 _skinnedRendererOverrideIds.Remove(id);
                 _meshInstanceTargetByComponent.Remove(id);
             }
@@ -4356,9 +4772,119 @@ namespace CustomTextureReplacer
             {
                 _meshColliderReferences.Remove(id);
                 _meshColliderOriginalMeshes.Remove(id);
+                _meshColliderOriginalMeshNames.Remove(id);
+                _meshColliderMissingOriginalLogged.Remove(id);
                 _meshColliderOverrideIds.Remove(id);
                 _meshInstanceTargetByComponent.Remove(id);
             }
+        }
+
+        private void RememberMeshFilterOriginalName(int id, Mesh mesh, MeshFilter owner)
+        {
+            var name = mesh != null ? mesh.name : owner?.sharedMesh?.name;
+            if (!string.IsNullOrEmpty(name))
+            {
+                _meshFilterOriginalMeshNames[id] = name;
+                if (mesh != null)
+                    _meshFilterMissingOriginalLogged.Remove(id);
+            }
+        }
+
+        private void RememberSkinnedOriginalName(int id, Mesh mesh, SkinnedMeshRenderer owner)
+        {
+            var name = mesh != null ? mesh.name : owner?.sharedMesh?.name;
+            if (!string.IsNullOrEmpty(name))
+            {
+                _skinnedOriginalMeshNames[id] = name;
+                if (mesh != null)
+                    _skinnedMissingOriginalLogged.Remove(id);
+            }
+        }
+
+        private void RememberColliderOriginalName(int id, Mesh mesh, MeshCollider owner)
+        {
+            var name = mesh != null ? mesh.name : owner?.sharedMesh?.name;
+            if (!string.IsNullOrEmpty(name))
+            {
+                _meshColliderOriginalMeshNames[id] = name;
+                if (mesh != null)
+                    _meshColliderMissingOriginalLogged.Remove(id);
+            }
+        }
+
+        private string ResolveMeshFilterTargetName(int id, MeshFilter filter, Mesh originalMesh)
+        {
+            if (originalMesh != null && !string.IsNullOrEmpty(originalMesh.name))
+            {
+                _meshFilterOriginalMeshNames[id] = originalMesh.name;
+                _meshFilterMissingOriginalLogged.Remove(id);
+                return originalMesh.name;
+            }
+
+            if (_meshFilterOriginalMeshNames.TryGetValue(id, out var cached) && !string.IsNullOrEmpty(cached))
+                return cached;
+
+            var current = filter.sharedMesh?.name;
+            if (!string.IsNullOrEmpty(current))
+            {
+                _meshFilterOriginalMeshNames[id] = current;
+                return current;
+            }
+
+            return null;
+        }
+
+        private string ResolveSkinnedTargetName(int id, SkinnedMeshRenderer renderer, Mesh originalMesh)
+        {
+            if (originalMesh != null && !string.IsNullOrEmpty(originalMesh.name))
+            {
+                _skinnedOriginalMeshNames[id] = originalMesh.name;
+                _skinnedMissingOriginalLogged.Remove(id);
+                return originalMesh.name;
+            }
+
+            if (_skinnedOriginalMeshNames.TryGetValue(id, out var cached) && !string.IsNullOrEmpty(cached))
+                return cached;
+
+            var current = renderer.sharedMesh?.name;
+            if (!string.IsNullOrEmpty(current))
+            {
+                _skinnedOriginalMeshNames[id] = current;
+                return current;
+            }
+
+            return null;
+        }
+
+        private string ResolveMeshColliderTargetName(int id, MeshCollider collider, Mesh originalMesh)
+        {
+            if (originalMesh != null && !string.IsNullOrEmpty(originalMesh.name))
+            {
+                _meshColliderOriginalMeshNames[id] = originalMesh.name;
+                _meshColliderMissingOriginalLogged.Remove(id);
+                return originalMesh.name;
+            }
+
+            if (_meshColliderOriginalMeshNames.TryGetValue(id, out var cached) && !string.IsNullOrEmpty(cached))
+                return cached;
+
+            var current = collider.sharedMesh?.name;
+            if (!string.IsNullOrEmpty(current))
+            {
+                _meshColliderOriginalMeshNames[id] = current;
+                return current;
+            }
+
+            return null;
+        }
+
+        private void LogMissingOriginal(HashSet<int> cache, int id, string category, string name)
+        {
+            if (!cache.Add(id))
+                return;
+
+            var display = string.IsNullOrEmpty(name) ? "<unknown>" : name;
+            SafeAppendDebug($"Missing original {category} mesh reference for '{display}' (component {id}); relying on cached name.");
         }
 
         private void CleanupRendererEntries()
