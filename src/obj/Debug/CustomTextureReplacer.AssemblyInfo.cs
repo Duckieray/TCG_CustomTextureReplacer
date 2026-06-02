@@ -13,7 +13,7 @@ using System.Reflection;
 [assembly: System.Reflection.AssemblyCompanyAttribute("CustomTextureReplacer")]
 [assembly: System.Reflection.AssemblyConfigurationAttribute("Debug")]
 [assembly: System.Reflection.AssemblyFileVersionAttribute("1.0.0.0")]
-[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+7756d088adf90cca73d94b761eadf980733c63f6")]
+[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+20e1625e1dce0b28c16ca04d1a5ca8ab0efac43a")]
 [assembly: System.Reflection.AssemblyProductAttribute("CustomTextureReplacer")]
 [assembly: System.Reflection.AssemblyTitleAttribute("CustomTextureReplacer")]
 [assembly: System.Reflection.AssemblyVersionAttribute("1.0.0.0")]

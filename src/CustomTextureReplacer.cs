@@ -54,6 +54,13 @@ namespace CustomTextureReplacer
             FolderOrder
         }
 
+        internal enum BoxColliderSearchScope
+        {
+            Self,
+            SelfAndChildren,
+            Parents
+        }
+
         private struct TextureCandidate
         {
             public string Path;
@@ -63,7 +70,6 @@ namespace CustomTextureReplacer
         }
 
         private const string HarmonyId = "com.duckieray.cardshop.customtextures.harmony";
-        private const float ScanIntervalSeconds = 2f;
         private const float MeshOverrideRetryWindowSeconds = 10f;
         private const float MeshOverrideRescanIntervalApplied = 0.25f;
         private const float MeshOverrideRescanIntervalPending = 0.5f;
@@ -87,6 +93,10 @@ namespace CustomTextureReplacer
         private readonly List<string> _newTextureNames = new List<string>(64);
         private readonly Dictionary<Texture, Texture> _textureOverrides = new Dictionary<Texture, Texture>();
         private readonly Dictionary<string, Texture> _textureOverridesByName = new Dictionary<string, Texture>(StringComparer.OrdinalIgnoreCase);
+        // Keeps track of duplicate texture names so overrides don't bleed across unrelated assets.
+        private readonly Dictionary<string, int> _textureNameCounts = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        private readonly HashSet<string> _ambiguousTextureNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        private readonly HashSet<string> _ambiguousTextureLog = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         private readonly Dictionary<Sprite, Sprite> _spriteOverrides = new Dictionary<Sprite, Sprite>();
         private readonly Dictionary<string, Sprite> _spriteOverridesByName = new Dictionary<string, Sprite>(StringComparer.OrdinalIgnoreCase);
         private readonly Dictionary<Sprite, Texture2D> _spriteOverrideTextures = new Dictionary<Sprite, Texture2D>();
@@ -125,6 +135,8 @@ namespace CustomTextureReplacer
         private readonly Dictionary<string, CardTextOverride> _cardOverrides = new Dictionary<string, CardTextOverride>(StringComparer.OrdinalIgnoreCase);
         private readonly Dictionary<string, CardTextOverride> _capturedCardData = new Dictionary<string, CardTextOverride>(StringComparer.OrdinalIgnoreCase);
         private readonly Dictionary<string, CardTextOverride> _meshCardOverrides = new Dictionary<string, CardTextOverride>(StringComparer.OrdinalIgnoreCase);
+        private readonly HashSet<string> _cardOverrideAliasKeys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        private readonly HashSet<string> _meshCardOverrideAliasKeys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         private readonly Dictionary<string, MeshOverrideData> _meshOverridesByTarget = new Dictionary<string, MeshOverrideData>(StringComparer.OrdinalIgnoreCase);
         private readonly HashSet<string> _meshTextureFolders = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         private readonly Dictionary<int, WeakReference<MeshFilter>> _meshFilterReferences = new Dictionary<int, WeakReference<MeshFilter>>();
@@ -142,6 +154,8 @@ namespace CustomTextureReplacer
         private readonly Dictionary<int, string> _meshColliderOriginalMeshNames = new Dictionary<int, string>();
         private readonly HashSet<int> _meshColliderMissingOriginalLogged = new HashSet<int>();
         private readonly HashSet<int> _meshColliderOverrideIds = new HashSet<int>();
+        private readonly List<BoxCollider> _boxColliderScratch = new List<BoxCollider>(8);
+        private readonly List<Vector3> _colliderVertexScratch = new List<Vector3>(2048);
         private readonly Dictionary<int, WeakReference<Renderer>> _rendererReferences = new Dictionary<int, WeakReference<Renderer>>();
         private readonly Dictionary<int, Material[]> _rendererOriginalMaterials = new Dictionary<int, Material[]>();
         private readonly HashSet<int> _rendererOverrideIds = new HashSet<int>();
@@ -197,7 +211,6 @@ namespace CustomTextureReplacer
         private bool _pendingDump;
         private bool _reapplyRequested;
         private bool _loggedHeartbeat;
-        private float _nextScanTime;
         private bool _meshOverridesDirty;
         private float _nextMeshOverrideScanTime;
         private float _meshOverrideRetryDeadline;
@@ -267,8 +280,6 @@ namespace CustomTextureReplacer
             ScheduleMeshOverrideReapply(0f);
             if (_enableAutoDumps != null && _enableAutoDumps.Value)
                 StartCoroutine(InitialDump());
-
-            _nextScanTime = Time.realtimeSinceStartup + ScanIntervalSeconds;
         }
 
         private void OnDestroy()
@@ -350,6 +361,7 @@ namespace CustomTextureReplacer
             _collectionScratch.Clear();
             _spriteScratch.Clear();
             _cardOverrides.Clear();
+            _cardOverrideAliasKeys.Clear();
 
             foreach (var tex in _generatedTextures)
             {
@@ -374,6 +386,7 @@ namespace CustomTextureReplacer
             _rawImageOverrideInstances.Clear();
             _meshTextureFolders.Clear();
             _meshCardOverrides.Clear();
+            _meshCardOverrideAliasKeys.Clear();
             Instance = null;
             _pendingSpriteAtlasReapply.Clear();
         }
@@ -460,16 +473,6 @@ namespace CustomTextureReplacer
                 _logger.LogInfo("[CustomTextureReplacer] Manual mesh dump triggered (F10).");
                 SafeAppendDebug("F10 pressed");
                 DumpAllMeshes();
-            }
-
-            if (Time.realtimeSinceStartup >= _nextScanTime)
-            {
-                _nextScanTime = Time.realtimeSinceStartup + ScanIntervalSeconds;
-                if (DetectNewTextures())
-                {
-                    SafeAppendDebug("Periodic scan detected new textures.");
-                    RequestReapply("PeriodicScan");
-                }
             }
 
             if (_reapplyRequested)
@@ -1223,6 +1226,7 @@ namespace CustomTextureReplacer
             }
 
             ApplyTextureOverridesToMaterials();
+            ApplyTextureOverridesToRenderers();
             ApplySpriteOverridesToComponents();
 
             if (replaced > 0 || skipped > 0)
@@ -1373,10 +1377,24 @@ namespace CustomTextureReplacer
             }
         }
 
+        private bool IsTextureNameAmbiguous(string name)
+        {
+            return !string.IsNullOrEmpty(name) && _ambiguousTextureNames.Contains(name);
+        }
+
         private bool TryCreateTextureOverride(Texture target, Texture2D replacement, int width, int height)
         {
             if (!(target is Texture2D targetTex) || replacement == null)
                 return false;
+
+            var textureName = targetTex.name;
+            var isAmbiguous = IsTextureNameAmbiguous(textureName);
+            if (isAmbiguous && _ambiguousTextureLog.Add(textureName))
+            {
+                _textureNameCounts.TryGetValue(textureName, out var count);
+                _logger.LogWarning($"[CustomTextureReplacer] Name-based override disabled for ambiguous texture '{textureName}' ({count} instances). Using direct references only.");
+                SafeAppendDebug($"Ambiguous texture '{textureName}' ({count}) will rely on direct references.");
+            }
 
             try
             {
@@ -1387,7 +1405,18 @@ namespace CustomTextureReplacer
                         if (TryCopyIntoTexture(replacement, tex2D, width, height, targetTex.name))
                         {
                             _textureOverrides[targetTex] = tex2D;
-                            _textureOverridesByName[targetTex.name] = tex2D;
+                            if (!string.IsNullOrEmpty(textureName))
+                            {
+                                if (!isAmbiguous)
+                                {
+                                    _textureOverridesByName[textureName] = tex2D;
+                                    LinkMatchingTexturesByName(textureName, tex2D, targetTex);
+                                }
+                                else
+                                {
+                                    _textureOverridesByName.Remove(textureName);
+                                }
+                            }
                             _overridesDirty = true;
                             return true;
                         }
@@ -1396,14 +1425,15 @@ namespace CustomTextureReplacer
                     }
                 }
 
-                if (_textureOverridesByName.TryGetValue(targetTex.name, out var nameOverride))
+                if (!string.IsNullOrEmpty(textureName) && !isAmbiguous && _textureOverridesByName.TryGetValue(textureName, out var nameOverride))
                 {
                     if (nameOverride is Texture2D tex2D && tex2D.width == width && tex2D.height == height)
                     {
                         if (TryCopyIntoTexture(replacement, tex2D, width, height, targetTex.name))
                         {
                             _textureOverrides[targetTex] = tex2D;
-                            _textureOverridesByName[targetTex.name] = tex2D;
+                            _textureOverridesByName[textureName] = tex2D;
+                            LinkMatchingTexturesByName(textureName, tex2D, targetTex);
                             _overridesDirty = true;
                             return true;
                         }
@@ -1434,20 +1464,16 @@ namespace CustomTextureReplacer
 
                 _generatedTextures.Add(newTexture);
                 _textureOverrides[targetTex] = newTexture;
-                _textureOverridesByName[targetTex.name] = newTexture;
-
-                // Link other instances with the same name to the override.
-                foreach (var tex in Resources.FindObjectsOfTypeAll<Texture2D>())
+                if (!string.IsNullOrEmpty(textureName))
                 {
-                    if (tex == null)
-                        continue;
-
-                    if (ReferenceEquals(tex, targetTex))
-                        continue;
-
-                    if (string.Equals(tex.name, targetTex.name, StringComparison.OrdinalIgnoreCase))
+                    if (!isAmbiguous)
                     {
-                        _textureOverrides[tex] = newTexture;
+                        _textureOverridesByName[textureName] = newTexture;
+                        LinkMatchingTexturesByName(textureName, newTexture, targetTex);
+                    }
+                    else
+                    {
+                        _textureOverridesByName.Remove(textureName);
                     }
                 }
 
@@ -1456,6 +1482,7 @@ namespace CustomTextureReplacer
                 SafeAppendDebug($"Texture override created for {targetTex.name}");
                 _overridesDirty = true;
                 ApplyTextureOverridesToMaterials(targetTex);
+                ApplyTextureOverridesToRenderers();
                 return true;
             }
             catch (Exception ex)
@@ -1463,6 +1490,23 @@ namespace CustomTextureReplacer
                 _logger.LogWarning($"[CustomTextureReplacer] Failed to create texture override for '{target?.name}': {ex.Message}");
                 SafeAppendDebug($"Texture override failed for {target?.name}: {ex.Message}");
                 return false;
+            }
+        }
+
+        private void LinkMatchingTexturesByName(string name, Texture replacement, Texture exclude)
+        {
+            if (string.IsNullOrEmpty(name) || replacement == null)
+                return;
+
+            foreach (var tex in Resources.FindObjectsOfTypeAll<Texture2D>())
+            {
+                if (tex == null || ReferenceEquals(tex, exclude))
+                    continue;
+
+                if (!string.Equals(tex.name, name, StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                _textureOverrides[tex] = replacement;
             }
         }
 
@@ -1629,8 +1673,13 @@ namespace CustomTextureReplacer
             if (_textureOverrides.TryGetValue(original, out var direct))
                 return direct;
 
-            if (_textureOverridesByName.TryGetValue(original.name, out var byName))
+            var name = original.name;
+            if (!string.IsNullOrEmpty(name) &&
+                !_ambiguousTextureNames.Contains(name) &&
+                _textureOverridesByName.TryGetValue(name, out var byName))
+            {
                 return byName;
+            }
 
             return null;
         }
@@ -2106,6 +2155,7 @@ namespace CustomTextureReplacer
             RevertAllMeshOverrides();
             DisposeMeshOverrideResources();
             _meshCardOverrides.Clear();
+            _meshCardOverrideAliasKeys.Clear();
 
             if (string.IsNullOrEmpty(_meshOverridesPath))
             {
@@ -2222,6 +2272,12 @@ namespace CustomTextureReplacer
                         ApplyToSkinnedMeshRenderer = GetBool(entryDict, "applyToSkinnedMeshRenderers", true),
                         ApplyToMeshCollider = GetBool(entryDict, "applyToMeshColliders", false)
                     };
+                    data.AutoAdjustBoxColliders = GetBool(entryDict, "autoBoxCollider", false);
+                    var boxColliderScopeValue = GetString(entryDict, "boxColliderScope");
+                    if (!string.IsNullOrEmpty(boxColliderScopeValue))
+                    {
+                        data.BoxColliderScope = ParseBoxColliderScope(boxColliderScopeValue);
+                    }
 
                     var shelfCount = GetInt(entryDict, "shelfCount", -1);
                     var instanceCount = GetInt(entryDict, "instanceCount", -1);
@@ -3777,6 +3833,7 @@ namespace CustomTextureReplacer
                         if (replacement != null && !ReferenceEquals(filter.sharedMesh, replacement))
                         {
                             filter.sharedMesh = replacement;
+                            AutoAdjustBoxColliders(overrideData, filter.transform, replacement);
                             applied = true;
                             SafeAppendDebug($"Mesh override applied to MeshFilter '{targetName}' using '{replacement.name}'.");
                             if (_logAssetLoads.Value)
@@ -3803,6 +3860,7 @@ namespace CustomTextureReplacer
                         if (originalMesh != null && !ReferenceEquals(filter.sharedMesh, originalMesh))
                         {
                             filter.sharedMesh = originalMesh;
+                            AutoAdjustBoxColliders(overrideData, filter.transform, originalMesh);
                             applied = true;
                         }
 
@@ -3815,8 +3873,9 @@ namespace CustomTextureReplacer
                 }
                 else if (_meshFilterOverrideIds.Remove(id))
                 {
+                    MeshOverrideData previousData = null;
                     if (_meshInstanceTargetByComponent.TryGetValue(id, out var previousTarget) &&
-                        _meshOverridesByTarget.TryGetValue(previousTarget, out var previousData))
+                        _meshOverridesByTarget.TryGetValue(previousTarget, out previousData))
                     {
                         UnregisterMeshInstance(previousData, filter.gameObject);
                     }
@@ -3825,6 +3884,7 @@ namespace CustomTextureReplacer
                     if (originalMesh != null && !ReferenceEquals(filter.sharedMesh, originalMesh))
                     {
                         filter.sharedMesh = originalMesh;
+                        AutoAdjustBoxColliders(previousData, filter.transform, originalMesh);
                         applied = true;
                     }
 
@@ -3918,6 +3978,7 @@ namespace CustomTextureReplacer
                         if (replacement != null && !ReferenceEquals(renderer.sharedMesh, replacement))
                         {
                             renderer.sharedMesh = replacement;
+                            AutoAdjustBoxColliders(overrideData, renderer.transform, replacement);
                             applied = true;
                             SafeAppendDebug($"Mesh override applied to SkinnedMeshRenderer '{targetName}' using '{replacement.name}'.");
                             if (_logAssetLoads.Value)
@@ -3942,6 +4003,7 @@ namespace CustomTextureReplacer
                         if (originalMesh != null && !ReferenceEquals(renderer.sharedMesh, originalMesh))
                         {
                             renderer.sharedMesh = originalMesh;
+                            AutoAdjustBoxColliders(overrideData, renderer.transform, originalMesh);
                             applied = true;
                         }
                         if (RestoreRendererMaterials(renderer))
@@ -3952,8 +4014,9 @@ namespace CustomTextureReplacer
                 }
                 else if (_skinnedRendererOverrideIds.Remove(id))
                 {
+                    MeshOverrideData previousData = null;
                     if (_meshInstanceTargetByComponent.TryGetValue(id, out var previousTarget) &&
-                        _meshOverridesByTarget.TryGetValue(previousTarget, out var previousData))
+                        _meshOverridesByTarget.TryGetValue(previousTarget, out previousData))
                     {
                         UnregisterMeshInstance(previousData, renderer.gameObject);
                     }
@@ -3962,6 +4025,7 @@ namespace CustomTextureReplacer
                     if (originalMesh != null && !ReferenceEquals(renderer.sharedMesh, originalMesh))
                     {
                         renderer.sharedMesh = originalMesh;
+                        AutoAdjustBoxColliders(previousData, renderer.transform, originalMesh);
                         applied = true;
                     }
                     if (RestoreRendererMaterials(renderer))
@@ -4127,6 +4191,106 @@ namespace CustomTextureReplacer
                     data.InstanceReferences.RemoveAt(i);
                 }
             }
+        }
+
+        private void AutoAdjustBoxColliders(MeshOverrideData data, Transform meshTransform, Mesh mesh)
+        {
+            if (data == null || meshTransform == null || mesh == null || !data.AutoAdjustBoxColliders)
+                return;
+
+            if (!PrepareColliderVertexScratch(mesh))
+                return;
+
+            CollectBoxColliders(meshTransform, data, _boxColliderScratch);
+            if (_boxColliderScratch.Count == 0)
+                return;
+
+            foreach (var collider in _boxColliderScratch)
+            {
+                if (collider == null)
+                    continue;
+
+                RecalculateBoxCollider(collider, meshTransform, _colliderVertexScratch);
+            }
+
+            _boxColliderScratch.Clear();
+        }
+
+        private bool PrepareColliderVertexScratch(Mesh mesh)
+        {
+            if (mesh == null)
+                return false;
+
+            var count = mesh.vertexCount;
+            if (count <= 0)
+                return false;
+
+            if (_colliderVertexScratch.Capacity < count)
+                _colliderVertexScratch.Capacity = count;
+            _colliderVertexScratch.Clear();
+            mesh.GetVertices(_colliderVertexScratch);
+            return _colliderVertexScratch.Count > 0;
+        }
+
+        private void CollectBoxColliders(Transform origin, MeshOverrideData data, List<BoxCollider> scratch)
+        {
+            scratch.Clear();
+            if (origin == null || data == null)
+                return;
+
+            switch (data.BoxColliderScope)
+            {
+                case BoxColliderSearchScope.SelfAndChildren:
+                    origin.GetComponentsInChildren(includeInactive: true, scratch);
+                    break;
+                case BoxColliderSearchScope.Parents:
+                    var current = origin;
+                    while (current != null)
+                    {
+                        current.GetComponents(scratch);
+                        if (scratch.Count > 0)
+                            break;
+                        current = current.parent;
+                    }
+                    break;
+                default:
+                    origin.GetComponents(scratch);
+                    break;
+            }
+
+            for (int i = scratch.Count - 1; i >= 0; i--)
+            {
+                if (scratch[i] == null)
+                    scratch.RemoveAt(i);
+            }
+        }
+
+        private void RecalculateBoxCollider(BoxCollider collider, Transform meshTransform, List<Vector3> vertices)
+        {
+            if (collider == null || meshTransform == null || vertices == null || vertices.Count == 0)
+                return;
+
+            var colliderTransform = collider.transform;
+            var min = new Vector3(float.PositiveInfinity, float.PositiveInfinity, float.PositiveInfinity);
+            var max = new Vector3(float.NegativeInfinity, float.NegativeInfinity, float.NegativeInfinity);
+
+            for (int i = 0; i < vertices.Count; i++)
+            {
+                var world = meshTransform.TransformPoint(vertices[i]);
+                var local = colliderTransform.InverseTransformPoint(world);
+                min = Vector3.Min(min, local);
+                max = Vector3.Max(max, local);
+            }
+
+            if (float.IsInfinity(min.x) || float.IsInfinity(max.x))
+                return;
+
+            var size = max - min;
+            if (size.x <= 0f || size.y <= 0f || size.z <= 0f)
+                return;
+
+            collider.center = (min + max) * 0.5f;
+            collider.size = size;
         }
 
         private void ApplyMeshInstanceNameOverrides(MeshOverrideData data, GameObject instance)
@@ -5008,15 +5172,20 @@ namespace CustomTextureReplacer
             if (string.IsNullOrEmpty(label))
                 return;
 
-            var entry = FindCardOverride(null, label);
-            if (entry == null || !entry.IsMeshOverride)
+            var entry = FindCardOverride(null, label, out var matchSource);
+            if (entry == null)
+                return;
+
+            var allowGlobalOverride = entry.IsMeshOverride || matchSource == CardOverrideMatchSource.CardAlias;
+            if (!allowGlobalOverride)
                 return;
 
             var id = text.GetInstanceID();
             var targetLabel = entry.DisplayName ?? string.Empty;
 
             if (_lastAppliedMeshLabels.TryGetValue(id, out var lastApplied) &&
-                string.Equals(lastApplied, targetLabel, StringComparison.Ordinal))
+                string.Equals(lastApplied, targetLabel, StringComparison.Ordinal) &&
+                string.Equals(label, targetLabel, StringComparison.Ordinal))
             {
                 return;
             }
@@ -5086,6 +5255,8 @@ namespace CustomTextureReplacer
         {
             destination.Clear();
             _collectionScratch.Clear();
+            _textureNameCounts.Clear();
+            _ambiguousTextureNames.Clear();
 
             void TryAdd(Texture2D tex)
             {
@@ -5100,7 +5271,26 @@ namespace CustomTextureReplacer
                     return;
 
                 if (_collectionScratch.Add(id))
+                {
                     destination.Add(tex);
+                    var name = tex.name;
+                    if (!string.IsNullOrEmpty(name))
+                    {
+                        if (_textureNameCounts.TryGetValue(name, out var count))
+                        {
+                            count++;
+                            _textureNameCounts[name] = count;
+                            if (count == 2)
+                            {
+                                _ambiguousTextureNames.Add(name);
+                            }
+                        }
+                        else
+                        {
+                            _textureNameCounts[name] = 1;
+                        }
+                    }
+                }
             }
 
             foreach (var tex in Resources.FindObjectsOfTypeAll<Texture2D>())
@@ -5153,6 +5343,40 @@ namespace CustomTextureReplacer
                         TryAdd(tex);
                     }
                 }
+            }
+
+            if (_ambiguousTextureNames.Count > 0)
+            {
+                var toRemove = new List<string>();
+                foreach (var pair in _textureOverridesByName)
+                {
+                    if (_ambiguousTextureNames.Contains(pair.Key))
+                    {
+                        toRemove.Add(pair.Key);
+                    }
+                }
+
+                foreach (var name in toRemove)
+                {
+                    _textureOverridesByName.Remove(name);
+                }
+
+                _ambiguousTextureLog.RemoveWhere(name => !_ambiguousTextureNames.Contains(name));
+
+                foreach (var name in _ambiguousTextureNames)
+                {
+                    if (_ambiguousTextureLog.Add(name))
+                    {
+                        _textureNameCounts.TryGetValue(name, out var count);
+                        var message = $"[CustomTextureReplacer] Multiple live textures share the name '{name}' ({count} instances). Skipping automatic PNG override for this name to avoid cross-bleeding between objects.";
+                        _logger.LogWarning(message);
+                        SafeAppendDebug($"Ambiguous texture name '{name}' detected ({count} instances); ignoring global override.");
+                    }
+                }
+            }
+            else if (_ambiguousTextureLog.Count > 0)
+            {
+                _ambiguousTextureLog.Clear();
             }
         }
 
@@ -5390,6 +5614,8 @@ namespace CustomTextureReplacer
             public HashSet<int> HiddenInstanceIds { get; } = new HashSet<int>();
             public Dictionary<int, ShelfSlotState> ShelfSlots { get; } = new Dictionary<int, ShelfSlotState>();
             public CardTextOverride CardOverride;
+            public bool AutoAdjustBoxColliders;
+            public BoxColliderSearchScope BoxColliderScope = BoxColliderSearchScope.Self;
         }
 
         internal sealed class ShelfSlotState
@@ -5545,6 +5771,7 @@ namespace CustomTextureReplacer
                 return;
 
             _cardOverrides[trimmed] = entry;
+            _cardOverrideAliasKeys.Add(trimmed);
             if (!string.IsNullOrEmpty(source))
             {
                 SafeAppendDebug($"CardOverrides alias '{trimmed}' mapped to '{entry.Id}' via {source}.");
@@ -5562,7 +5789,7 @@ namespace CustomTextureReplacer
 
             entry.IsMeshOverride = true;
 
-            void AddAlias(string alias)
+            void AddAlias(string alias, bool trackAlias = true)
             {
                 if (string.IsNullOrWhiteSpace(alias))
                     return;
@@ -5572,9 +5799,13 @@ namespace CustomTextureReplacer
                     return;
 
                 _meshCardOverrides[trimmed] = entry;
+                if (trackAlias)
+                {
+                    _meshCardOverrideAliasKeys.Add(trimmed);
+                }
             }
 
-            AddAlias(entry.Id);
+            AddAlias(entry.Id, trackAlias: false);
             AddAlias(entry.DisplayName);
 
             if (entry.Aliases != null)
@@ -5820,6 +6051,7 @@ namespace CustomTextureReplacer
         private void LoadCardOverrides(bool logDetails)
         {
             _cardOverrides.Clear();
+            _cardOverrideAliasKeys.Clear();
 
             if (string.IsNullOrEmpty(_cardOverridesPath))
                 return;
@@ -6009,6 +6241,29 @@ namespace CustomTextureReplacer
             return defaultValue;
         }
 
+        private static BoxColliderSearchScope ParseBoxColliderScope(string value)
+        {
+            if (string.IsNullOrEmpty(value))
+                return BoxColliderSearchScope.Self;
+
+            switch (value.Trim().ToLowerInvariant())
+            {
+                case "children":
+                case "selfandchildren":
+                case "self_children":
+                case "self+children":
+                case "selfchildren":
+                    return BoxColliderSearchScope.SelfAndChildren;
+                case "parent":
+                case "parents":
+                case "selfandparents":
+                case "selfparents":
+                    return BoxColliderSearchScope.Parents;
+                default:
+                    return BoxColliderSearchScope.Self;
+            }
+        }
+
         private static int GetInt(Dictionary<string, object> dict, string key, int defaultValue = 0)
         {
             if (dict == null || string.IsNullOrEmpty(key))
@@ -6060,7 +6315,38 @@ namespace CustomTextureReplacer
             AddCandidate(Path.Combine(assemblyDir, "CardOverrides.json"));
             AddCandidate(Path.Combine(Paths.PluginPath, "CardOverrides.json"));
 
-            var resolved = candidates.FirstOrDefault(File.Exists) ?? candidates.FirstOrDefault() ?? Path.Combine(Paths.PluginPath, "CardOverrides.json");
+            string resolved = null;
+            try
+            {
+                DateTime SafeGetLastWriteTimeUtc(string path)
+                {
+                    try
+                    {
+                        return File.GetLastWriteTimeUtc(path);
+                    }
+                    catch
+                    {
+                        return DateTime.MinValue;
+                    }
+                }
+
+                var existing = candidates.Where(File.Exists).ToList();
+                if (existing.Count > 0)
+                {
+                    resolved = existing
+                        .OrderByDescending(SafeGetLastWriteTimeUtc)
+                        .ThenBy(path => existing.IndexOf(path))
+                        .FirstOrDefault();
+                }
+            }
+            catch
+            {
+                resolved = null;
+            }
+
+            resolved ??= candidates.FirstOrDefault(File.Exists)
+                        ?? candidates.FirstOrDefault()
+                        ?? Path.Combine(Paths.PluginPath, "CardOverrides.json");
 
             var changed = !string.Equals(previous, resolved, StringComparison.OrdinalIgnoreCase);
             _cardOverridesPath = resolved;
@@ -6230,7 +6516,7 @@ namespace CustomTextureReplacer
 
             try
             {
-                var entry = FindCardOverride(cardUI, null);
+                var entry = FindCardOverride(cardUI, null, out _);
                 if (entry == null)
                     return;
 
@@ -6325,7 +6611,7 @@ namespace CustomTextureReplacer
 
                 var originalLabel = nameText.text;
                 var cardUI = CheckPricePanelUIBindings.CardUIField?.GetValue(panel) as CardUI;
-                var entry = FindCardOverride(cardUI, originalLabel);
+                var entry = FindCardOverride(cardUI, originalLabel, out _);
                 if (entry == null)
                     return;
 
@@ -6351,7 +6637,7 @@ namespace CustomTextureReplacer
                 if (CheckoutItemBarBindings.NameTextField?.GetValue(itemBar) is not TMP_Text nameText)
                     return;
 
-                var entry = FindCardOverride(null, originalLabel);
+                var entry = FindCardOverride(null, originalLabel, out _);
                 if (entry == null)
                     return;
 
@@ -6376,7 +6662,7 @@ namespace CustomTextureReplacer
 
                 var originalLabel = nameText.text;
                 var cardUI = ItemPriceGraphScreenBindings.CardUIField?.GetValue(screen) as CardUI;
-                var entry = FindCardOverride(cardUI, originalLabel);
+                var entry = FindCardOverride(cardUI, originalLabel, out _);
                 if (entry == null)
                     return;
 
@@ -6389,21 +6675,29 @@ namespace CustomTextureReplacer
             }
         }
 
-        private CardTextOverride FindCardOverride(CardUI cardUI, string label)
+        private CardTextOverride FindCardOverride(CardUI cardUI, string label, out CardOverrideMatchSource matchSource)
         {
+            matchSource = CardOverrideMatchSource.None;
             if (!HasAnyCardOverrides())
                 return null;
 
+            // Prefer explicit card overrides over metadata embedded in mesh overrides.
             if (cardUI != null)
             {
                 var key = ResolveMonsterKey(cardUI);
                 if (!string.IsNullOrEmpty(key))
                 {
-                    if (_meshCardOverrides.TryGetValue(key, out var meshEntry) && meshEntry != null)
-                        return meshEntry;
-
                     if (_cardOverrides.TryGetValue(key, out var entry) && entry != null)
+                    {
+                        matchSource = _cardOverrideAliasKeys.Contains(key) ? CardOverrideMatchSource.CardAlias : CardOverrideMatchSource.CardId;
                         return entry;
+                    }
+
+                    if (_meshCardOverrides.TryGetValue(key, out var meshEntry) && meshEntry != null)
+                    {
+                        matchSource = _meshCardOverrideAliasKeys.Contains(key) ? CardOverrideMatchSource.MeshAlias : CardOverrideMatchSource.MeshId;
+                        return meshEntry;
+                    }
                 }
             }
 
@@ -6412,21 +6706,33 @@ namespace CustomTextureReplacer
                 var trimmed = label.Trim();
                 if (!string.IsNullOrEmpty(trimmed))
                 {
-                    if (_meshCardOverrides.TryGetValue(trimmed, out var meshByLabel) && meshByLabel != null)
-                        return meshByLabel;
-
                     if (_cardOverrides.TryGetValue(trimmed, out var direct) && direct != null)
+                    {
+                        matchSource = _cardOverrideAliasKeys.Contains(trimmed) ? CardOverrideMatchSource.CardAlias : CardOverrideMatchSource.CardId;
                         return direct;
+                    }
+
+                    if (_meshCardOverrides.TryGetValue(trimmed, out var meshByLabel) && meshByLabel != null)
+                    {
+                        matchSource = _meshCardOverrideAliasKeys.Contains(trimmed) ? CardOverrideMatchSource.MeshAlias : CardOverrideMatchSource.MeshId;
+                        return meshByLabel;
+                    }
                 }
 
                 var prefix = GetNamePrefix(label);
                 if (!string.IsNullOrEmpty(prefix))
                 {
-                    if (_meshCardOverrides.TryGetValue(prefix, out var meshFromLabel) && meshFromLabel != null)
-                        return meshFromLabel;
-
                     if (_cardOverrides.TryGetValue(prefix, out var fromLabel) && fromLabel != null)
+                    {
+                        matchSource = _cardOverrideAliasKeys.Contains(prefix) ? CardOverrideMatchSource.CardAlias : CardOverrideMatchSource.CardId;
                         return fromLabel;
+                    }
+
+                    if (_meshCardOverrides.TryGetValue(prefix, out var meshFromLabel) && meshFromLabel != null)
+                    {
+                        matchSource = _meshCardOverrideAliasKeys.Contains(prefix) ? CardOverrideMatchSource.MeshAlias : CardOverrideMatchSource.MeshId;
+                        return meshFromLabel;
+                    }
                 }
             }
 
@@ -6622,6 +6928,15 @@ namespace CustomTextureReplacer
             public string Rarity;
             public string Fame;
             public bool IsMeshOverride;
+        }
+
+        private enum CardOverrideMatchSource
+        {
+            None,
+            CardId,
+            CardAlias,
+            MeshId,
+            MeshAlias
         }
 
         private static object TryGetMemberValue(object target, string memberName)
